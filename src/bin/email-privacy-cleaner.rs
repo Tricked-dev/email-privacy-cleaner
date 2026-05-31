@@ -29,6 +29,11 @@ use url::Url;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Additional ClearURLs-format rule pack to load (repeatable). Merged on top
+    /// of the config's `rule_packs`.
+    #[arg(long = "rule-pack", value_name = "PATH", global = true)]
+    rule_pack: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -81,15 +86,17 @@ enum Command {
     },
 }
 
-fn load_config(path: &Option<PathBuf>) -> Result<CleanerConfig, String> {
-    match path {
-        Some(p) => CleanerConfig::from_toml_file(p).map_err(|e| e.to_string()),
-        None => {
-            let mut c = CleanerConfig::default();
-            c.finalize();
-            Ok(c)
-        }
-    }
+fn load_config(path: &Option<PathBuf>, extra_packs: &[PathBuf]) -> Result<CleanerConfig, String> {
+    let mut c = match path {
+        Some(p) => CleanerConfig::from_toml_file(p).map_err(|e| e.to_string())?,
+        None => CleanerConfig::default(),
+    };
+    c.rule_packs
+        .extend(extra_packs.iter().map(|p| p.to_string_lossy().into_owned()));
+    // (Re)finalize so CLI-supplied packs are compiled into the ruleset, whether
+    // or not the config was already finalized when loaded from a file.
+    c.finalize();
+    Ok(c)
 }
 
 fn main() -> ExitCode {
@@ -104,9 +111,10 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
+    let Cli { command, rule_pack } = cli;
+    match command {
         Command::CleanMessage { config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let mut raw = Vec::new();
             io::stdin()
                 .read_to_end(&mut raw)
@@ -131,7 +139,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::CleanHtml { config, base_url } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let mut html = String::new();
             io::stdin()
                 .read_to_string(&mut html)
@@ -151,28 +159,28 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::ExplainUrl { url, config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let parsed = Url::parse(&url).map_err(|e| format!("invalid URL: {e}"))?;
             explain_url(&parsed, &cfg);
             Ok(())
         }
         Command::ExplainMessage { config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let raw = read_stdin_bytes()?;
             explain_message(&raw, &cfg)
         }
         Command::PrintTrackers { config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let raw = read_stdin_bytes()?;
             print_trackers(&raw, &cfg)
         }
         Command::DiffMessage { config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             let raw = read_stdin_bytes()?;
             diff_message(&raw, &cfg)
         }
         Command::TestRules { dir, config } => {
-            let cfg = load_config(&config)?;
+            let cfg = load_config(&config, &rule_pack)?;
             test_rules(&dir, &cfg)
         }
     }

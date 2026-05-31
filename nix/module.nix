@@ -19,6 +19,22 @@ let
   cfg = config.services.email-privacy-milter;
   tomlFormat = pkgs.formats.toml { };
 
+  # Resolve each rule pack to a store path. Plain paths pass through; an
+  # `{ url; sha256; }` entry is prefetched at build time with `fetchurl` and
+  # pinned by hash, so the daemon loads it offline from the store (the
+  # per-message cleaning path never touches the network). Passed to the daemon
+  # as `--rule-pack` args, so this composes with EITHER `settings` or
+  # `configFile` — the packs merge on top of whatever `rule_packs` the config
+  # already lists.
+  resolvedRulePacks = map (
+    p: if builtins.isAttrs p then pkgs.fetchurl { inherit (p) url sha256; } else p
+  ) cfg.rulePacks;
+
+  rulePackArgs = lib.concatMap (p: [
+    "--rule-pack"
+    (toString p)
+  ]) resolvedRulePacks;
+
   # A config file is only passed when the user supplies one; otherwise the
   # daemon runs on its built-in defaults plus the --listen override.
   configPath =
@@ -73,7 +89,11 @@ in
           mode = "enforce";
           remove_pixels = true;
           clean_query_params = true;
-          extra_tracking_params = [ "my_custom_tracker" ];
+          extra_tracking_params = [ "my_custom_tracker" "mkt_*" ];
+          # Exclusions (carve-outs that override the rule pack):
+          keep_params = [ "ref" ];          # never strip these
+          exclude_domains = [ "intranet.example" ]; # leave these hosts untouched
+          disabled_providers = [ "amazon" ];        # switch off one provider
         }
       '';
       description = ''
@@ -90,6 +110,50 @@ in
         Path to a pre-written TOML config file. Mutually exclusive with
         {option}`settings`; use this to manage the config out of band (e.g. via
         a secret-management tool).
+      '';
+    };
+
+    rulePacks = lib.mkOption {
+      type =
+        with lib.types;
+        listOf (
+          either path (submodule {
+            options = {
+              url = lib.mkOption {
+                type = str;
+                description = "URL of a ClearURLs-format rule pack to prefetch at build time.";
+              };
+              sha256 = lib.mkOption {
+                type = str;
+                description = "Expected hash of the pack, as accepted by {function}`fetchurl`.";
+              };
+            };
+          })
+        );
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          # A pack already in the store / repo:
+          ./my-extra-rules.json
+          # Or prefetch the upstream ClearURLs data (pinned by hash) so it is
+          # baked into the store and loaded fully offline at runtime:
+          {
+            url = "https://rules2.clearurls.xyz/data.min.json";
+            sha256 = "sha256-AAAA...";
+          }
+        ]
+      '';
+      description = ''
+        External ClearURLs-format rule packs to merge on top of the built-ins.
+        Each entry is either a path, or an `{ url; sha256; }` attrset that is
+        fetched with {function}`fetchurl` and pinned. The resolved store paths
+        are passed to the daemon as `--rule-pack` arguments and merged on top of
+        the `rule_packs` in {option}`settings`/{option}`configFile`, so this
+        composes with both and needs no network access at runtime.
+
+        > The upstream ClearURLs rules are copyleft (LGPL); only their
+        > *parser* ships with this package. Prefetching the data here keeps your
+        > build reproducible and offline.
       '';
     };
 
@@ -140,6 +204,7 @@ in
             cfg.listen
           ]
           ++ configArgs
+          ++ rulePackArgs
           ++ cfg.extraArgs
         );
 

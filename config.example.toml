@@ -108,6 +108,26 @@ extra_pixel_domains = [
   # "beacon.mycorp.example",
 ]
 
+# --- Exclusions (carve-outs that override the rule pack) ---------------------
+
+# Query params that are NEVER stripped, even if a built-in/pack rule matches
+# them. Case-insensitive; a trailing '*' matches by prefix.
+keep_params = [
+  # "ref",
+  # "mc_*",
+]
+
+# Hosts left ENTIRELY untouched — no param stripping, no redirect unwrapping.
+# Suffix match (so "intranet.example" also covers "*.intranet.example").
+exclude_domains = [
+  # "intranet.example",
+]
+
+# Rule-pack provider names to switch off (removed from the compiled ruleset).
+disabled_providers = [
+  # "amazon",
+]
+
 # --- External rule packs (ClearURLs format) ---------------------------------
 #
 # The built-in rules ship as a ClearURLs-format JSON document compiled into the
@@ -123,12 +143,18 @@ rule_packs = [
   # "/etc/email-privacy-cleaner/clearurls.data.min.json",
 ]
 
-# Pack URLs are fetched once at startup. Only honoured when built with the
-# `network` feature; ignored otherwise. (This is a startup download, not part
-# of the per-message cleaning path, which remains fully offline.)
+# Pack URLs. `file://` URLs and bare local paths are read offline in any build;
+# `http(s)://` URLs are fetched once at startup and require the `network`
+# feature. (Either way this is startup-only; the per-message path stays offline.)
+# Nix users can prefetch a remote pack into the store and reference it as a
+# file:// path here — or, more idiomatically, via the module's `rulePacks`.
 rule_pack_urls = [
-  # "https://rules2.clearurls.xyz/data.min.json",
+  # "https://rules2.clearurls.xyz/data.min.json",   # needs the `network` feature
+  # "file:///var/lib/email-privacy-cleaner/clearurls.json",  # offline
 ]
+
+# Tip: the CLI and milter also accept `--rule-pack <PATH>` (repeatable), which
+# merges on top of these — handy with `--config` or a read-only config file.
 
 # --- Milter daemon -----------------------------------------------------------
 

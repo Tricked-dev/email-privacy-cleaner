@@ -227,8 +227,11 @@ default. Highlights:
 | `blocked_domains` | `[]` | links neutralised to `about:blank` |
 | `extra_tracking_params` | `[]` | merged with built-ins (`prefix*` allowed) |
 | `extra_pixel_domains` | `[]` | merged with built-ins |
+| `keep_params` | `[]` | params never stripped, even if a rule matches (`prefix*`) |
+| `exclude_domains` | `[]` | hosts left entirely untouched (suffix match) |
+| `disabled_providers` | `[]` | rule-pack provider names to switch off |
 | `rule_packs` | `[]` | external ClearURLs-format pack files to merge |
-| `rule_pack_urls` | `[]` | pack URLs (fetched at startup; `network` feature only) |
+| `rule_pack_urls` | `[]` | pack URLs (`file://`/paths load offline; `http(s)` needs `network`) |
 
 ## Rule packs (ClearURLs format)
 
@@ -345,7 +348,21 @@ Add the flake and import the module:
               remove_pixels = true;
               clean_query_params = true;
               extra_tracking_params = [ "my_custom_tracker" ];
+              # Exclusions (carve-outs that override the rule pack):
+              keep_params = [ "ref" ];
+              exclude_domains = [ "intranet.example" ];
+              disabled_providers = [ "amazon" ];
             };
+            # Declaratively prefetch external ClearURLs-format packs into the
+            # store (pinned by hash) and load them offline at runtime. Works
+            # alongside `settings` AND `configFile`.
+            rulePacks = [
+              ./my-extra-rules.json
+              {
+                url = "https://rules2.clearurls.xyz/data.min.json";
+                sha256 = "sha256-AAAA...";   # nix will tell you the real hash
+              }
+            ];
           };
         }
       ];
@@ -357,8 +374,10 @@ Add the flake and import the module:
 The module renders `settings` to a TOML config (or accepts a `configFile`) and
 runs the daemon as a hardened, stateless systemd service (`DynamicUser`,
 `ProtectSystem=strict`, locked-down syscall/address-family filters, no
-capabilities, loopback-only egress when listening on localhost). Point Stalwart
-at the configured `listen` address as shown in
+capabilities, loopback-only egress when listening on localhost). `rulePacks` are
+prefetched at build time and passed as `--rule-pack` arguments, so they compose
+with either `settings` or `configFile` and need no runtime network. Point
+Stalwart at the configured `listen` address as shown in
 [Stalwart integration](#stalwart-integration).
 
 ## License

@@ -40,6 +40,19 @@ pub struct RedirectUnwrapResult {
 /// `redirections` (the destination is extracted from the URL itself — no
 /// network access). The extracted destination is always validated before use.
 pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapResult {
+    // An excluded host is left entirely untouched (no unwrap, no param strip).
+    if let Some(host) = url.host_str() {
+        if config.is_excluded_domain(host) {
+            return RedirectUnwrapResult {
+                url: url.clone(),
+                original: url.clone(),
+                unwrapped: false,
+                provider: None,
+                rejected: None,
+            };
+        }
+    }
+
     let ruleset = config.ruleset();
     let url_str = url.as_str();
     let provider = ruleset.detect_provider(url_str).map(|s| s.to_string());

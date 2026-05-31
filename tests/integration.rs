@@ -531,3 +531,77 @@ fn external_rule_pack_file_is_loaded_and_applied() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn rule_pack_url_accepts_file_scheme_offline() {
+    // Nix prefetch scenario: a remote pack is fetched into a local path and
+    // referenced via a file:// URL — must load with NO `network` feature.
+    let path = std::env::temp_dir().join(format!(
+        "epc_filepack_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        r#"{"providers":{"acme":{"urlPattern":"^https?://acme\\.test","rules":["sid"]}}}"#,
+    )
+    .unwrap();
+
+    let toml = format!(
+        "preserve_original_href = false\nrule_pack_urls = [\"file://{}\"]\n",
+        path.to_string_lossy()
+    );
+    let cfg = CleanerConfig::from_toml_str(&toml).unwrap();
+
+    let html = r#"<html><body><a href="https://acme.test/p?sid=1&keep=2">x</a></body></html>"#;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: filepack\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
+    raw.extend_from_slice(html.as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    let r = clean_message(&raw, &cfg).unwrap();
+    let out = html_body_of(&r.cleaned);
+    assert!(!out.contains("sid=1"), "got: {out}");
+    assert!(out.contains("keep=2"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn keep_params_exclusion_protects_a_param_and_domain() {
+    let cfg = CleanerConfig::from_toml_str(
+        "preserve_original_href = false\nkeep_params = [\"utm_source\"]\nexclude_domains = [\"trusted.example\"]\n",
+    )
+    .unwrap();
+
+    let html = concat!(
+        "<html><body>",
+        // utm_source kept (on the keep-list), utm_medium still stripped.
+        "<a href=\"https://shop.example/a?utm_source=news&utm_medium=email&id=1\">a</a>",
+        // whole host excluded -> untouched.
+        "<a href=\"https://trusted.example/b?utm_source=x&fbclid=y\">b</a>",
+        "</body></html>"
+    );
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: keep\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
+    raw.extend_from_slice(html.as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    let r = clean_message(&raw, &cfg).unwrap();
+    let out = html_body_of(&r.cleaned);
+    assert!(
+        out.contains("utm_source=news"),
+        "kept param survives: {out}"
+    );
+    assert!(
+        !out.contains("utm_medium=email"),
+        "other tracker still stripped"
+    );
+    // Excluded domain: everything survives.
+    assert!(out.contains("https://trusted.example/b?utm_source=x&fbclid=y"));
+}

@@ -166,6 +166,14 @@ impl Ruleset {
         self.providers.len()
     }
 
+    /// Remove providers whose name matches any of `names` (case-insensitive).
+    /// Used to honour the `disabled_providers` config exclusion.
+    pub fn disable(&mut self, names: &[String]) {
+        let disabled: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+        self.providers
+            .retain(|p| !disabled.contains(&p.name.to_ascii_lowercase()));
+    }
+
     fn matching<'a>(&'a self, url: &'a str) -> impl Iterator<Item = &'a Provider> + 'a {
         self.providers
             .iter()
@@ -328,6 +336,22 @@ mod tests {
         // ...but not elsewhere, and the built-in globals still work.
         assert!(!rs.param_is_tracking("https://other.example/x", "sid", true, false));
         assert!(rs.param_is_tracking("https://other.example/x", "utm_source", true, false));
+    }
+
+    #[test]
+    fn disable_removes_named_providers() {
+        let mut rs = Ruleset::builtin();
+        assert_eq!(
+            rs.detect_provider("https://www.amazon.com/dp/x"),
+            Some("amazon")
+        );
+        rs.disable(&["AMAZON".to_string()]);
+        assert_eq!(rs.detect_provider("https://www.amazon.com/dp/x"), None);
+        // Other providers remain.
+        assert_eq!(
+            rs.detect_provider("https://news.us1.list-manage.com/track/click?u=1"),
+            Some("mailchimp")
+        );
     }
 
     #[test]

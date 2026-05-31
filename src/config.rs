@@ -199,11 +199,24 @@ pub struct CleanerConfig {
     /// Additional tracking-pixel host suffixes, merged on top of the rule pack.
     pub extra_pixel_domains: Vec<String>,
 
+    // ---- Exclusions (carve-outs that override the rule pack) ----
+    /// Query-parameter names that are **never** stripped, even when a rule pack
+    /// matches them (case-insensitive, `prefix*` allowed). Use this to keep a
+    /// parameter a built-in or external rule would otherwise remove.
+    pub keep_params: Vec<String>,
+    /// Host suffixes whose URLs are left **entirely** untouched — no param
+    /// stripping and no redirect unwrapping (case-insensitive suffix match).
+    pub exclude_domains: Vec<String>,
+    /// Rule-pack provider names to disable (removed from the compiled ruleset).
+    /// Lets you switch off a single built-in or external provider by name.
+    pub disabled_providers: Vec<String>,
+
     /// External ClearURLs-format rule pack files (paths) to load and merge on
     /// top of the built-in pack.
     pub rule_packs: Vec<String>,
-    /// External ClearURLs-format rule pack URLs to fetch and merge. Only used
-    /// when built with the `network` feature; ignored otherwise.
+    /// External ClearURLs-format rule pack URLs to load and merge. `file://`
+    /// URLs and bare local paths are read offline in any build; `http(s)://`
+    /// URLs are fetched at startup and require the `network` feature.
     pub rule_pack_urls: Vec<String>,
 
     /// Listen address for the milter daemon.
@@ -214,6 +227,10 @@ pub struct CleanerConfig {
     tracking_params: Option<HashSet<String>>,
     #[serde(skip)]
     tracking_prefixes: Option<Vec<String>>,
+    #[serde(skip)]
+    keep_param_set: Option<HashSet<String>>,
+    #[serde(skip)]
+    keep_param_prefixes: Option<Vec<String>>,
     #[serde(skip)]
     ruleset: Option<Arc<Ruleset>>,
 }
@@ -243,11 +260,16 @@ impl Default for CleanerConfig {
             blocked_domains: Vec::new(),
             extra_tracking_params: Vec::new(),
             extra_pixel_domains: Vec::new(),
+            keep_params: Vec::new(),
+            exclude_domains: Vec::new(),
+            disabled_providers: Vec::new(),
             rule_packs: Vec::new(),
             rule_pack_urls: Vec::new(),
             listen: "127.0.0.1:11333".to_string(),
             tracking_params: None,
             tracking_prefixes: None,
+            keep_param_set: None,
+            keep_param_prefixes: None,
             ruleset: None,
         }
     }
@@ -257,6 +279,24 @@ impl Default for CleanerConfig {
 fn builtin_ruleset() -> Arc<Ruleset> {
     static BUILTIN: OnceLock<Arc<Ruleset>> = OnceLock::new();
     BUILTIN.get_or_init(|| Arc::new(Ruleset::builtin())).clone()
+}
+
+/// Split a list of parameter patterns into an exact-match (lower-cased) set and
+/// a list of prefixes (entries ending in `*`).
+fn split_param_patterns(list: &[String]) -> (HashSet<String>, Vec<String>) {
+    let mut set: HashSet<String> = HashSet::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    for p in list {
+        let p = p.to_ascii_lowercase();
+        if let Some(stripped) = p.strip_suffix('*') {
+            if !stripped.is_empty() {
+                prefixes.push(stripped.to_string());
+            }
+        } else {
+            set.insert(p);
+        }
+    }
+    (set, prefixes)
 }
 
 impl CleanerConfig {
@@ -279,44 +319,73 @@ impl CleanerConfig {
     /// lists; [`from_toml_*`](Self::from_toml_str) and the milter/CLI entry
     /// points do this automatically.
     pub fn finalize(&mut self) {
-        let (set, prefixes) = self.build_param_tables();
+        let (set, prefixes) = split_param_patterns(&self.extra_tracking_params);
         self.tracking_params = Some(set);
         self.tracking_prefixes = Some(prefixes);
+
+        let (keep_set, keep_prefixes) = split_param_patterns(&self.keep_params);
+        self.keep_param_set = Some(keep_set);
+        self.keep_param_prefixes = Some(keep_prefixes);
+
         self.ruleset = Some(Arc::new(self.build_ruleset()));
     }
 
-    /// Build the combined rule pack: the built-in pack plus any external packs
-    /// (files, and — with the `network` feature — URLs). Packs that fail to
-    /// load are skipped with a warning so a bad pack can't take the cleaner down.
+    /// Build the combined rule pack: the built-in pack plus any external packs,
+    /// then drop any `disabled_providers`. Packs that fail to load are skipped
+    /// with a warning so a bad pack can't take the cleaner down.
     fn build_ruleset(&self) -> Ruleset {
         let mut rs = Ruleset::builtin();
         for path in &self.rule_packs {
-            match std::fs::read_to_string(path) {
-                Ok(s) => match Ruleset::from_clearurls_str(&s) {
-                    Ok(pack) => rs.merge(pack),
-                    Err(e) => eprintln!("warning: rule pack {path:?} failed to parse: {e}"),
-                },
-                Err(e) => eprintln!("warning: rule pack {path:?} could not be read: {e}"),
-            }
+            self.merge_pack_file(&mut rs, path);
         }
-        #[cfg(feature = "network")]
-        for url in &self.rule_pack_urls {
-            match crate::network::fetch_rule_pack(url, self.timeout_ms) {
-                Ok(s) => match Ruleset::from_clearurls_str(&s) {
-                    Ok(pack) => rs.merge(pack),
-                    Err(e) => eprintln!("warning: rule pack {url:?} failed to parse: {e}"),
-                },
-                Err(e) => eprintln!("warning: rule pack {url:?} could not be fetched: {e}"),
-            }
+        for entry in &self.rule_pack_urls {
+            self.merge_pack_url(&mut rs, entry);
         }
-        #[cfg(not(feature = "network"))]
-        if !self.rule_pack_urls.is_empty() {
-            eprintln!(
-                "warning: {} rule_pack_urls configured but the `network` feature is disabled; ignoring",
-                self.rule_pack_urls.len()
-            );
+        if !self.disabled_providers.is_empty() {
+            rs.disable(&self.disabled_providers);
         }
         rs
+    }
+
+    fn merge_pack_file(&self, rs: &mut Ruleset, path: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(s) => match Ruleset::from_clearurls_str(&s) {
+                Ok(pack) => rs.merge(pack),
+                Err(e) => eprintln!("warning: rule pack {path:?} failed to parse: {e}"),
+            },
+            Err(e) => eprintln!("warning: rule pack {path:?} could not be read: {e}"),
+        }
+    }
+
+    /// Load a `rule_pack_urls` entry. `file://` URLs and bare local paths are
+    /// read from disk in any build (so Nix users can prefetch a remote pack into
+    /// the store and reference it offline); `http(s)://` URLs require the
+    /// `network` feature.
+    fn merge_pack_url(&self, rs: &mut Ruleset, entry: &str) {
+        let entry = entry.trim();
+        if let Some(path) = entry.strip_prefix("file://") {
+            self.merge_pack_file(rs, path);
+            return;
+        }
+        let is_http = entry.starts_with("http://") || entry.starts_with("https://");
+        if !is_http {
+            // Treat anything else as a local path.
+            self.merge_pack_file(rs, entry);
+            return;
+        }
+        #[cfg(feature = "network")]
+        match crate::network::fetch_rule_pack(entry, self.timeout_ms) {
+            Ok(s) => match Ruleset::from_clearurls_str(&s) {
+                Ok(pack) => rs.merge(pack),
+                Err(e) => eprintln!("warning: rule pack {entry:?} failed to parse: {e}"),
+            },
+            Err(e) => eprintln!("warning: rule pack {entry:?} could not be fetched: {e}"),
+        }
+        #[cfg(not(feature = "network"))]
+        eprintln!(
+            "warning: rule pack {entry:?} needs the `network` feature to fetch over HTTP; \
+             prefetch it and use a file path or file:// URL instead. Ignoring."
+        );
     }
 
     /// The active rule pack (built-in + merged external packs). Falls back to the
@@ -328,37 +397,56 @@ impl CleanerConfig {
         }
     }
 
-    /// Build the exact-match set and prefix list of *user-supplied* global
-    /// tracking parameter names. A configured name ending in `*` (e.g. `mkt_*`)
-    /// becomes a prefix rule.
-    fn build_param_tables(&self) -> (HashSet<String>, Vec<String>) {
-        let mut set: HashSet<String> = HashSet::new();
-        let mut prefixes: Vec<String> = Vec::new();
-        for p in &self.extra_tracking_params {
-            let p = p.to_ascii_lowercase();
-            if let Some(stripped) = p.strip_suffix('*') {
-                if !stripped.is_empty() {
-                    prefixes.push(stripped.to_string());
-                }
-            } else {
-                set.insert(p);
-            }
-        }
-        (set, prefixes)
-    }
-
     fn params(&self) -> Cow<'_, HashSet<String>> {
         match &self.tracking_params {
             Some(s) => Cow::Borrowed(s),
-            None => Cow::Owned(self.build_param_tables().0),
+            None => Cow::Owned(split_param_patterns(&self.extra_tracking_params).0),
         }
     }
 
     fn param_prefixes(&self) -> Cow<'_, [String]> {
         match &self.tracking_prefixes {
             Some(v) => Cow::Borrowed(v),
-            None => Cow::Owned(self.build_param_tables().1),
+            None => Cow::Owned(split_param_patterns(&self.extra_tracking_params).1),
         }
+    }
+
+    fn keep_params_set(&self) -> Cow<'_, HashSet<String>> {
+        match &self.keep_param_set {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(split_param_patterns(&self.keep_params).0),
+        }
+    }
+
+    fn keep_params_prefixes(&self) -> Cow<'_, [String]> {
+        match &self.keep_param_prefixes {
+            Some(v) => Cow::Borrowed(v),
+            None => Cow::Owned(split_param_patterns(&self.keep_params).1),
+        }
+    }
+
+    /// Returns `true` if `name` is on the keep-list and must never be stripped,
+    /// even when a rule pack matches it (`extra_tracking_params`-style `prefix*`
+    /// patterns are honoured).
+    pub fn is_kept_param(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.keep_params_set().contains(&name)
+            || self
+                .keep_params_prefixes()
+                .iter()
+                .any(|p| name.starts_with(p))
+    }
+
+    /// Returns `true` if `host` is excluded from all cleaning (suffix match).
+    pub fn is_excluded_domain(&self, host: &str) -> bool {
+        if self.exclude_domains.is_empty() {
+            return false;
+        }
+        let host = host.to_ascii_lowercase();
+        self.exclude_domains
+            .iter()
+            .map(|d| d.to_ascii_lowercase())
+            .any(|d| host == d || host.ends_with(&format!(".{d}")))
     }
 
     /// Returns `true` if `name` matches a **user-supplied** global tracking
@@ -488,6 +576,29 @@ mod tests {
         assert!(c.is_tracking_param("exact_one"));
         assert!(!c.is_tracking_param("mkt")); // prefix needs the stem
         assert!(!c.is_tracking_param("keep_me"));
+    }
+
+    #[test]
+    fn keep_params_and_exclude_domains() {
+        let mut c = CleanerConfig {
+            keep_params: vec!["utm_source".into(), "keep_*".into()],
+            exclude_domains: vec!["trusted.example".into()],
+            ..Default::default()
+        };
+        c.finalize();
+        assert!(c.is_kept_param("utm_source"));
+        assert!(c.is_kept_param("UTM_SOURCE"));
+        assert!(c.is_kept_param("keep_this"));
+        assert!(!c.is_kept_param("utm_medium"));
+        assert!(c.is_excluded_domain("mail.trusted.example"));
+        assert!(!c.is_excluded_domain("other.example"));
+    }
+
+    #[test]
+    fn disabled_providers_drop_from_ruleset() {
+        let c = CleanerConfig::from_toml_str("disabled_providers = [\"amazon\"]").unwrap();
+        let rs = c.ruleset();
+        assert!(rs.detect_provider("https://www.amazon.com/dp/x").is_none());
     }
 
     #[test]

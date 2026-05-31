@@ -40,8 +40,12 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
     let ruleset = config.ruleset();
     let url_str = url.as_str();
 
-    // A provider exception means "leave this URL exactly as-is".
-    if ruleset.is_exception(url_str) {
+    // An excluded host, or a provider exception, means "leave this URL as-is".
+    let excluded = url
+        .host_str()
+        .map(|h| config.is_excluded_domain(h))
+        .unwrap_or(false);
+    if excluded || ruleset.is_exception(url_str) {
         return UrlCleanResult {
             url: url.clone(),
             changed: false,
@@ -61,13 +65,15 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
         let key_plus = key_raw.replace('+', " ");
         let key = percent_decode_str(&key_plus).decode_utf8_lossy();
 
-        let is_tracker = config.is_tracking_param(&key)
-            || ruleset.param_is_tracking(
-                url_str,
-                &key,
-                config.apply_vendor_rules,
-                config.strip_referral_marketing,
-            );
+        // The keep-list always wins, even over a matching rule.
+        let is_tracker = !config.is_kept_param(&key)
+            && (config.is_tracking_param(&key)
+                || ruleset.param_is_tracking(
+                    url_str,
+                    &key,
+                    config.apply_vendor_rules,
+                    config.strip_referral_marketing,
+                ));
 
         if is_tracker {
             removed.push(key.into_owned());
