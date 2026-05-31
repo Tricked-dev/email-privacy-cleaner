@@ -7,7 +7,7 @@
 //! HTTP redirects — under strict SSRF protections.
 //!
 //! Guarantees regardless of build:
-//! * allowlisted destination domains only,
+//! * allowlisted redirector domains only,
 //! * never fetches images,
 //! * no cookies, no auth, no JavaScript,
 //! * private / loopback / link-local / metadata IPs are blocked,
@@ -44,7 +44,7 @@ pub fn resolve(url: &Url, config: &CleanerConfig) -> NetworkResolveResult {
             note: "network resolution disabled by config".into(),
         };
     }
-    // The destination host must be explicitly allowlisted.
+    // The redirector host must be explicitly allowlisted before any network I/O.
     match url.host_str() {
         Some(host) if config.is_allowlisted_domain(host) => {}
         _ => {
@@ -135,9 +135,10 @@ mod network_impl {
                     note: "destination failed preflight".into(),
                 };
             }
-            // The allowlist is a permission boundary: an allowlisted
-            // shortener must not be able to bounce us to an arbitrary
-            // off-allowlist host. Re-check each hop.
+            // Only allowlisted redirector hosts are contacted. If an
+            // allowlisted redirector points at an off-allowlist destination,
+            // that Location may be returned as the final URL after validation,
+            // but it is not fetched.
             match current.host_str() {
                 Some(h) if config.is_allowlisted_domain(h) => {}
                 _ => {
@@ -176,15 +177,21 @@ mod network_impl {
             let status = resp.status();
             if (300..400).contains(&status) {
                 if let Some(loc) = resp.header("location") {
-                    match current.join(loc) {
-                        Ok(next) => {
+                    match classify_redirect_location(&current, loc, config) {
+                        Ok(RedirectHop::Follow(next)) => {
                             current = next;
                             continue;
                         }
-                        Err(_) => {
+                        Ok(RedirectHop::Final(final_url)) => {
+                            return NetworkResolveResult {
+                                url: Some(final_url),
+                                note: "resolved to off-allowlist final location".into(),
+                            };
+                        }
+                        Err(note) => {
                             return NetworkResolveResult {
                                 url: None,
-                                note: "invalid redirect location".into(),
+                                note: note.into(),
                             }
                         }
                     }
@@ -225,6 +232,85 @@ mod network_impl {
                 any
             }
             Err(_) => false,
+        }
+    }
+
+    #[derive(Debug)]
+    enum RedirectHop {
+        Follow(Url),
+        Final(Url),
+    }
+
+    fn classify_redirect_location(
+        current: &Url,
+        location: &str,
+        config: &CleanerConfig,
+    ) -> Result<RedirectHop, &'static str> {
+        let next = current
+            .join(location)
+            .map_err(|_| "invalid redirect location")?;
+        if !preflight_ok(&next) {
+            return Err("redirect location failed preflight");
+        }
+        match next.host_str() {
+            Some(h) if config.is_allowlisted_domain(h) => Ok(RedirectHop::Follow(next)),
+            Some(_) => Ok(RedirectHop::Final(next)),
+            None => Err("redirect location missing host"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cfg() -> CleanerConfig {
+            let mut c = CleanerConfig::default();
+            c.network_redirect_resolution = true;
+            c.allowlisted_redirect_domains = vec!["links.example".into()];
+            c
+        }
+
+        #[test]
+        fn off_allowlist_location_is_final_without_following() {
+            let current = Url::parse("https://links.example/click/abc").unwrap();
+            let hop = classify_redirect_location(
+                &current,
+                "https://shop.example/product?utm_source=news",
+                &cfg(),
+            )
+            .unwrap();
+
+            match hop {
+                RedirectHop::Final(url) => {
+                    assert_eq!(url.as_str(), "https://shop.example/product?utm_source=news");
+                }
+                RedirectHop::Follow(_) => panic!("off-allowlist destination must be final"),
+            }
+        }
+
+        #[test]
+        fn allowlisted_location_is_followed() {
+            let current = Url::parse("https://links.example/click/abc").unwrap();
+            let hop =
+                classify_redirect_location(&current, "/next", &cfg()).expect("valid next hop");
+
+            match hop {
+                RedirectHop::Follow(url) => assert_eq!(url.as_str(), "https://links.example/next"),
+                RedirectHop::Final(_) => panic!("allowlisted redirector should be followed"),
+            }
+        }
+
+        #[test]
+        fn private_ip_location_is_rejected() {
+            let current = Url::parse("https://links.example/click/abc").unwrap();
+            let err = classify_redirect_location(
+                &current,
+                "http://169.254.169.254/latest/meta-data/",
+                &cfg(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, "redirect location failed preflight");
         }
     }
 }

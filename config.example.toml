@@ -101,8 +101,10 @@ timeout_ms = 1500
 #
 # When enabled (requires building with `--features network`), redirects that
 # could not be unwrapped offline may be resolved by following HTTP redirects.
-# Strict SSRF protections always apply: allowlist-only, HEAD-first, no cookies,
-# no auth, no JS, private/loopback/link-local/metadata IPs blocked, max 5 hops.
+# Strict SSRF protections always apply: only allowlisted redirector hosts are
+# contacted, HEAD-first, no cookies, no auth, no JS, and private / loopback /
+# link-local / metadata IPs are blocked. Off-allowlist final Location targets
+# may be accepted after validation, but are not fetched. Max 5 hops.
 network_redirect_resolution = false
 allowlisted_redirect_domains = [
   # "links.trusted-esp.com",

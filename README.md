@@ -270,6 +270,53 @@ pack still loads.
 > parser, not that data. Download it and point `rule_packs`/`rule_pack_urls` at
 > it if you want it.
 
+## Redirect unwrapping
+
+Email platforms often replace normal links with a click-tracking URL. This
+project handles those redirects in two layers:
+
+* **Offline unwrapping** is the default path. It works when the redirect URL
+  already contains the real destination in a query parameter or path fragment.
+  Common examples are SendGrid-style links with a `url=...` value and similar
+  ESP wrappers. The destination is decoded, validated, cleaned again for
+  tracking parameters, and then written back into the message. No HTTP request
+  is made.
+* **Network redirect resolution** is for wrappers that do **not** expose the
+  destination in the URL itself. Mailchimp `list-manage.com/track/click` links
+  are the typical example: the only way to discover the final URL is to ask the
+  tracking server for its HTTP `Location` redirect.
+
+Network resolution is compiled in by the default `network` cargo feature, but
+it is still off at runtime. To use it, enable it explicitly and list the domains
+the resolver may contact:
+
+```toml
+network_redirect_resolution = true
+allowlisted_redirect_domains = [
+  "list-manage.com",
+  "links.trusted-esp.com",
+]
+```
+
+The allowlist is intentionally strict, but it applies to hosts the resolver is
+allowed to **contact**, not to every possible final website. Each contacted
+redirector hop must match `allowlisted_redirect_domains` by exact host or suffix
+match. If an allowlisted redirector returns a `Location` pointing at an
+off-allowlist destination, that destination can be accepted after validation and
+written into the message, but it is not fetched. This makes network resolution
+useful for ESP click links that jump to many different merchant/news sites
+without turning the cleaner into a general-purpose web crawler.
+
+Do not add broad entries such as `com` or `net`; that would allow contacting
+far more hosts than intended. Prefer specific ESP redirector domains you trust
+to receive HEAD requests from the cleaner.
+
+The resolver uses `HEAD`, follows at most 5 redirects, applies the configured
+timeout, sends no cookies or auth, executes no JavaScript, and re-checks each
+hop for blocked private, loopback, link-local, metadata, and other internal IP
+ranges. If any check fails, the original link is kept, apart from normal query
+parameter cleaning.
+
 ## Security model
 
 * **No network by default** — stage-1 unwrapping is purely string/decoding work.
@@ -279,10 +326,11 @@ pack still loads.
   are rejected** so a visible link is never pointed at internal infrastructure.
 * **Nested URL-encoding** is decoded up to depth 3; `javascript:`, `file:`,
   `data:` destinations are always rejected.
-* **Optional network resolver** (when explicitly enabled): allowlist-only,
-  HEAD-first, no cookies/auth/JS, never fetches images, max 5 redirects,
-  per-request timeout, and re-checks resolved IPs against the SSRF blocklist on
-  every hop.
+* **Optional network resolver** (when explicitly enabled): contacts only
+  allowlisted redirector hosts, HEAD-first, no cookies/auth/JS, never fetches
+  images, max 5 redirects, per-request timeout, and re-checks contacted hosts
+  against the SSRF blocklist on every hop. Off-allowlist final `Location`
+  targets are validated but not fetched.
 * **Bounded memory/CPU**: size limits on the message and each HTML part; the
   HTML rewriter (`lol_html`) is streaming.
 
@@ -398,8 +446,9 @@ Stalwart at the configured `listen` address as shown in
 
 The `network` cargo feature is **enabled by default**, so a stock
 `cargo build` / `nix build` compiles it in. It only adds *capability*, not
-behaviour: everything it enables stays inert until you opt in, and the
-per-message cleaning path is still fully offline.
+behaviour: everything it enables stays inert until you opt in. The per-message
+cleaning path remains fully offline unless `network_redirect_resolution = true`
+is set.
 
 Building with `--no-default-features` drops the networking code entirely. The
 only things unavailable in that build are:
