@@ -1,0 +1,11 @@
+From: Sender <s@example.com>
+To: User <user@example.org>
+Subject: Broken markup
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body><p>Unclosed paragraph
+<a href=https://e.example/?utm_id=99&keep=1>click here<img src="https://t.example.net/x.gif" width=1 height=1
+<div>more <b>bold text
+</body>

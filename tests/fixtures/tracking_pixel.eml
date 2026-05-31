@@ -1,0 +1,14 @@
+From: Sender <s@example.com>
+To: User <user@example.org>
+Subject: Hidden trackers
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p>Welcome.</p>
+<img src="https://t.example.net/o.gif" width="1" height="1" alt="" />
+<img src="https://beacon.example.com/p.png" style="display:none" />
+<img src="https://doubleclick.net/pixel" alt="" width="3" height="3" />
+<img src="https://cdn.example.com/hero.jpg" width="600" height="200" alt="Hero image" />
+</body></html>

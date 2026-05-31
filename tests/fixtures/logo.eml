@@ -1,0 +1,12 @@
+From: Sender <s@example.com>
+To: User <user@example.org>
+Subject: Just a logo
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p>Brought to you by:</p>
+<img src="https://cdn.example.com/logo.png" width="200" height="60" alt="Example Inc logo" />
+<img src="https://cdn.example.com/avatar.png" width="48" height="48" alt="avatar" />
+</body></html>
