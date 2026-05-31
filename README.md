@@ -29,12 +29,15 @@ It is also **sender-aware**:
   and left byte-for-byte intact (its recipient token survives); its target can
   be surfaced in an `X-Privacy-Cleaner-Unsubscribe` header.
 
-An optional, **opt-in** network redirect resolver exists behind the `network`
-cargo feature; it is disabled by default and heavily SSRF-guarded.
+A network redirect resolver and HTTP(S) rule-pack fetching are compiled in by
+default (the `network` cargo feature), but both stay **inert unless you opt in**
+at runtime, and the resolver is heavily SSRF-guarded. See
+[the note on the network feature](#note-on-the-network-feature) to build them
+out entirely.
 
-> No network access. No JavaScript execution. No image fetching. Attachments
-> are never altered. The cleaning path is deterministic and bounded — suitable
-> for the synchronous SMTP DATA stage.
+> No network access during cleaning. No JavaScript execution. No image
+> fetching. Attachments are never altered. The per-message cleaning path is
+> deterministic and bounded — suitable for the synchronous SMTP DATA stage.
 
 ## Crate layout
 
@@ -105,9 +108,10 @@ X-Privacy-Cleaner-Error: <short error>     # only on fail-open
 ```bash
 cargo build --release
 # binaries in target/release/{email-privacy-cleaner,email-privacy-milter}
+# the `network` feature is on by default (see the note at the bottom)
 
-# with the optional network resolver compiled in:
-cargo build --release --features network
+# fully offline build (no networking code compiled in):
+cargo build --release --no-default-features
 ```
 
 ## CLI usage
@@ -379,6 +383,24 @@ prefetched at build time and passed as `--rule-pack` arguments, so they compose
 with either `settings` or `configFile` and need no runtime network. Point
 Stalwart at the configured `listen` address as shown in
 [Stalwart integration](#stalwart-integration).
+
+## Note on the `network` feature
+
+The `network` cargo feature is **enabled by default**, so a stock
+`cargo build` / `nix build` compiles it in. It only adds *capability*, not
+behaviour: everything it enables stays inert until you opt in, and the
+per-message cleaning path is still fully offline.
+
+Building with `--no-default-features` drops the networking code entirely. The
+only things unavailable in that build are:
+
+* the optional network **redirect resolver** (`network_redirect_resolution`); and
+* fetching `http(s)://` entries in `rule_pack_urls`.
+
+Everything else is unchanged — including `file://` and local-path rule packs,
+which still load offline. (The resolver is also off at runtime by default even
+when compiled in, so a default build behaves identically until you flip
+`network_redirect_resolution = true` or add an `http(s)://` rule-pack URL.)
 
 ## License
 
