@@ -27,8 +27,10 @@ pub struct CleanStats {
     pub urls_cleaned: usize,
     /// Total redirect links unwrapped.
     pub redirects_unwrapped: usize,
-    /// Total tracking pixels removed.
+    /// Total tracking pixels removed (including CSS background beacons).
     pub pixels_removed: usize,
+    /// Total hyperlink-auditing `ping` attributes stripped.
+    pub pings_stripped: usize,
 }
 
 /// Result of [`clean_message`](crate::clean_message).
@@ -122,6 +124,7 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
             stats.urls_cleaned += res.urls_cleaned;
             stats.redirects_unwrapped += res.redirects_unwrapped;
             stats.pixels_removed += res.pixels_removed;
+            stats.pings_stripped += res.pings_stripped;
 
             if eff.mode.is_enforce() && res.changed {
                 if let Some(rep) = build_replacement(raw, part, res.html.as_bytes(), &line_ending) {
@@ -264,6 +267,10 @@ pub fn build_audit_headers(
         (
             "X-Privacy-Cleaner-Pixels-Removed".into(),
             stats.pixels_removed.to_string(),
+        ),
+        (
+            "X-Privacy-Cleaner-Link-Pings-Stripped".into(),
+            stats.pings_stripped.to_string(),
         ),
         (
             "X-Privacy-Cleaner-Body-Modified".into(),

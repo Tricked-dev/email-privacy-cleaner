@@ -124,11 +124,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 .write_all(&result.cleaned)
                 .map_err(|e| e.to_string())?;
             eprintln!(
-                "html_parts={} urls_cleaned={} redirects_unwrapped={} pixels_removed={} modified={}{}",
+                "html_parts={} urls_cleaned={} redirects_unwrapped={} pixels_removed={} pings_stripped={} modified={}{}",
                 result.stats.html_parts,
                 result.stats.urls_cleaned,
                 result.stats.redirects_unwrapped,
                 result.stats.pixels_removed,
+                result.stats.pings_stripped,
                 result.modified,
                 result
                     .error
@@ -153,8 +154,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 .write_all(result.html.as_bytes())
                 .map_err(|e| e.to_string())?;
             eprintln!(
-                "urls_cleaned={} redirects_unwrapped={} pixels_removed={}",
-                result.urls_cleaned, result.redirects_unwrapped, result.pixels_removed
+                "urls_cleaned={} redirects_unwrapped={} pixels_removed={} pings_stripped={}",
+                result.urls_cleaned,
+                result.redirects_unwrapped,
+                result.pixels_removed,
+                result.pings_stripped
             );
             Ok(())
         }
@@ -297,8 +301,11 @@ fn explain_message(raw: &[u8], cfg: &CleanerConfig) -> Result<(), String> {
     report_cfg.mode = Mode::ReportOnly;
     if let Ok(r) = clean_message_fail_open(raw, &report_cfg) {
         println!(
-            "\nwould-clean: urls_cleaned={} redirects_unwrapped={} pixels_removed={}",
-            r.stats.urls_cleaned, r.stats.redirects_unwrapped, r.stats.pixels_removed
+            "\nwould-clean: urls_cleaned={} redirects_unwrapped={} pixels_removed={} pings_stripped={}",
+            r.stats.urls_cleaned,
+            r.stats.redirects_unwrapped,
+            r.stats.pixels_removed,
+            r.stats.pings_stripped
         );
         println!("audit headers:");
         for (n, v) in &r.audit_headers {
@@ -387,15 +394,15 @@ fn print_trackers(raw: &[u8], cfg: &CleanerConfig) -> Result<(), String> {
         }
     }
 
-    // Pixel detection via a report-only HTML pass count.
+    // Pixel / ping detection via a report-only HTML pass count.
     let mut report_cfg = (*eff).clone();
     report_cfg.mode = Mode::ReportOnly;
-    let pixels = clean_message_fail_open(raw, &report_cfg)
-        .map(|r| r.stats.pixels_removed)
-        .unwrap_or(0);
+    let (pixels, pings) = clean_message_fail_open(raw, &report_cfg)
+        .map(|r| (r.stats.pixels_removed, r.stats.pings_stripped))
+        .unwrap_or((0, 0));
 
     println!(
-        "\nsummary: redirect_wrappers={wrappers} param_tracking_links={param_trackers} tracking_pixels={pixels}"
+        "\nsummary: redirect_wrappers={wrappers} param_tracking_links={param_trackers} tracking_pixels={pixels} link_pings={pings}"
     );
     Ok(())
 }

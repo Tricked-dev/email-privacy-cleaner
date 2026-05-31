@@ -19,6 +19,17 @@ clean_text_plain = false
 # Remove likely tracking pixels / beacons from HTML.
 remove_pixels = true
 
+# Also neutralise tracking beacons hidden in CSS rather than an <img>: a
+# `url(...)` in an inline style (background / background-image, ...) or the
+# legacy `background="..."` attribute, when it points at a known beacon host or
+# is fetched by a hidden / 1x1 element. Visible backgrounds on normal-sized
+# elements are left alone. Only applies when remove_pixels is true.
+neutralize_css_beacons = true
+
+# Strip the hyperlink-auditing `ping` attribute from <a>/<area> tags so a click
+# never fires a hidden background beacon to the listed URLs.
+strip_link_ping = true
+
 # Strip known tracking query parameters (utm_*, fbclid, gclid, ...).
 # Entries in extra_tracking_params may end with '*' to match by prefix.
 clean_query_params = true

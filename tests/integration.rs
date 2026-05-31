@@ -133,6 +133,77 @@ fn tracking_pixels_removed_logo_kept() {
 }
 
 #[test]
+fn css_beacons_neutralized_and_link_pings_stripped() {
+    let raw = fixture("css_beacon.eml");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified);
+
+    // A hidden background-image beacon + a legacy `background=` beacon = 2 CSS
+    // beacons, counted alongside any pixels removed.
+    assert_eq!(r.stats.pixels_removed, 2);
+    // The hyperlink-auditing ping attribute is stripped.
+    assert_eq!(r.stats.pings_stripped, 1);
+
+    let html = html_body_of(&r.cleaned);
+    assert!(
+        !html.contains("google-analytics.com"),
+        "hidden CSS beacon gone"
+    );
+    assert!(
+        !html.contains("doubleclick.net"),
+        "legacy background beacon gone"
+    );
+    assert!(!html.contains("track.example.net"), "ping target gone");
+    assert!(!html.contains("ping="), "ping attribute removed");
+    // The legitimate, visible hero background survives untouched.
+    assert!(html.contains("https://cdn.example.com/hero.jpg"));
+    // The normal tracking param on the visible link is still cleaned.
+    assert!(!html.contains("utm_source"));
+    assert!(html.contains("id=1"));
+
+    // Surfaced as an audit header.
+    let full = as_str(&r.cleaned);
+    assert!(full.contains("X-Privacy-Cleaner-Link-Pings-Stripped: 1"));
+    assert!(full.contains("X-Privacy-Cleaner-Pixels-Removed: 2"));
+}
+
+#[test]
+fn css_beacons_respect_report_only_mode() {
+    let mut c = CleanerConfig::default();
+    c.mode = Mode::ReportOnly;
+    c.finalize();
+    let raw = fixture("css_beacon.eml");
+    let r = clean_message(&raw, &c).unwrap();
+    assert!(!r.modified, "report-only must not modify the body");
+    // Counts are still computed.
+    assert_eq!(r.stats.pixels_removed, 2);
+    assert_eq!(r.stats.pings_stripped, 1);
+    // Body untouched: the beacons and ping are still present.
+    let full = as_str(&r.cleaned);
+    assert!(full.contains("google-analytics.com"));
+    assert!(full.contains("ping="));
+}
+
+#[test]
+fn css_beacon_neutralization_can_be_disabled() {
+    let mut c = cfg();
+    c.neutralize_css_beacons = false;
+    c.strip_link_ping = false;
+    c.finalize();
+    let raw = fixture("css_beacon.eml");
+    let r = clean_message(&raw, &c).unwrap();
+    // With both off, only the <img>-style pixel logic and link cleaning run; no
+    // CSS beacons or pings are touched.
+    assert_eq!(r.stats.pixels_removed, 0);
+    assert_eq!(r.stats.pings_stripped, 0);
+    let html = html_body_of(&r.cleaned);
+    assert!(html.contains("google-analytics.com"));
+    assert!(html.contains("ping="));
+    // The ordinary tracking param is still stripped (link cleaning is separate).
+    assert!(!html.contains("utm_source"));
+}
+
+#[test]
 fn legit_logo_not_removed() {
     let raw = fixture("logo.eml");
     let r = clean_message(&raw, &cfg()).unwrap();

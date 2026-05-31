@@ -149,6 +149,16 @@ pub struct CleanerConfig {
     pub clean_text_plain: bool,
     /// Remove likely tracking pixels from HTML.
     pub remove_pixels: bool,
+    /// Neutralise tracking beacons referenced from CSS rather than an `<img>`:
+    /// a `url(...)` in an inline `style` (`background`/`background-image`, …) or
+    /// the legacy `background="…"` attribute, when it points at a known beacon
+    /// host or is fetched by an element that is itself hidden or 1×1. These are
+    /// counted alongside the pixels removed and only apply when `remove_pixels`
+    /// is enabled.
+    pub neutralize_css_beacons: bool,
+    /// Strip the hyperlink-auditing `ping` attribute from `<a>`/`<area>` tags so
+    /// a click never fires a background beacon to the listed URLs.
+    pub strip_link_ping: bool,
     /// Strip known tracking query parameters from URLs.
     pub clean_query_params: bool,
     /// Apply host-specific (non-global) provider rules from the rule pack
@@ -242,6 +252,8 @@ impl Default for CleanerConfig {
             clean_html: true,
             clean_text_plain: false,
             remove_pixels: true,
+            neutralize_css_beacons: true,
+            strip_link_ping: true,
             clean_query_params: true,
             apply_vendor_rules: true,
             strip_referral_marketing: false,

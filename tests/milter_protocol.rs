@@ -103,8 +103,9 @@ fn full_milter_conversation_modifies_and_adds_headers() {
     assert!(!body_str.contains("utm_source"), "param should be stripped");
     assert!(body_str.contains("id=1"));
 
-    // Audit headers added (8 of them): the original seven plus the policy header.
-    assert_eq!(add_headers.len(), 8);
+    // Audit headers added (9 of them): the original seven, the link-pings
+    // counter, and the policy header.
+    assert_eq!(add_headers.len(), 9);
     let names: Vec<String> = add_headers
         .iter()
         .map(|d| {

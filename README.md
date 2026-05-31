@@ -7,13 +7,18 @@ standalone via the CLI).
 
 It performs these independent, deterministic, **offline** transformations:
 
-1. **Tracking-pixel removal** — drops 1×1 / hidden / known-beacon `<img>` tags.
-2. **Tracking query-parameter stripping** — `utm_*`, `fbclid`, `gclid`,
+1. **Tracking-pixel removal** — drops 1×1 / hidden / known-beacon `<img>` tags,
+   and neutralises beacons hidden in CSS (`background-image: url(…)` in an
+   inline `style`, the legacy `background="…"` attribute) when the URL is a
+   known beacon host or is fetched by a hidden / 1×1 element.
+2. **Hyperlink-auditing removal** — strips the `ping` attribute from `<a>`/
+   `<area>`, which would otherwise fire a hidden POST beacon on every click.
+3. **Tracking query-parameter stripping** — `utm_*`, `fbclid`, `gclid`,
    `mc_cid`, `_hsenc`, … (configurable, case-insensitive; `prefix*` supported).
-3. **Vendor-specific URL cleaning** — host-scoped rules for Amazon (`pf_rd_*`,
+4. **Vendor-specific URL cleaning** — host-scoped rules for Amazon (`pf_rd_*`,
    `tag`, …), YouTube (`si`), eBay (`_trkparms`), Twitter/X, LinkedIn, Reddit,
    TikTok and more, shipped in the built-in rule pack.
-4. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
+5. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
    Constant Contact, HubSpot, Customer.io, Iterable, Klaviyo, Mailgun,
    Brevo/Sendinblue, Postmark, SparkPost — **only** when the destination is
    explicitly embedded in the link and passes validation.
@@ -96,7 +101,8 @@ X-Privacy-Cleaner-Mode: enforce | report-only
 X-Privacy-Cleaner-HTML-Parts: <n>
 X-Privacy-Cleaner-URLs-Cleaned: <n>
 X-Privacy-Cleaner-Redirects-Unwrapped: <n>
-X-Privacy-Cleaner-Pixels-Removed: <n>
+X-Privacy-Cleaner-Pixels-Removed: <n>          # incl. CSS background beacons
+X-Privacy-Cleaner-Link-Pings-Stripped: <n>
 X-Privacy-Cleaner-Body-Modified: yes | no
 X-Privacy-Cleaner-Policy: default | sensitive-sender | custom:<domain>
 X-Privacy-Cleaner-Unsubscribe: <url>       # when surface_unsubscribe + present
@@ -216,6 +222,8 @@ default. Highlights:
 | `clean_html` | `true` | rewrite text/html parts |
 | `clean_text_plain` | `false` | query-clean text/plain parts |
 | `remove_pixels` | `true` | drop tracking pixels |
+| `neutralize_css_beacons` | `true` | neutralise CSS `background-image` / `background=` beacons (needs `remove_pixels`) |
+| `strip_link_ping` | `true` | strip the hyperlink-auditing `ping` attribute |
 | `clean_query_params` | `true` | strip tracking params |
 | `apply_vendor_rules` | `true` | host-scoped (non-global) rule-pack rules |
 | `strip_referral_marketing` | `false` | also strip `referralMarketing` params |
@@ -287,7 +295,9 @@ cargo clippy --all-targets
 
 Fixture-based coverage (`tests/fixtures/*.eml` + `tests/integration.rs`) includes:
 multipart/alternative, Mailchimp / SendGrid / HubSpot links, hidden 1×1 pixels,
-a legitimate small logo that must survive, magic login links that must not
+CSS background-image beacons and the legacy `background=` attribute, hyperlink
+`ping` stripping, a legitimate small logo (and visible background) that must
+survive, magic login links that must not
 break, malformed HTML, quoted-printable and base64 HTML parts, a non-UTF-8
 (ISO-8859-1) charset, nested URL-encoding, malicious `javascript:`/`file:`
 redirects, private-IP redirect destinations, attachment preservation, and a
