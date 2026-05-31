@@ -1,0 +1,10 @@
+From: List <list@news.example>
+To: User <user@example.org>
+Subject: Mailchimp tracked link
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p><a href="https://news.us1.list-manage.com/track/click?u=abc123&id=def456&e=ghi789&mc_cid=campaign01&mc_eid=member01">Open the update</a></p>
+</body></html>

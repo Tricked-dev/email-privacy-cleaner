@@ -1,0 +1,11 @@
+From: App <noreply@app.example>
+To: User <user@example.org>
+Subject: Your sign-in link
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p>Click to sign in:</p>
+<p><a href="https://app.example/login/verify?token=eyJhbGciOiJIUzI1NiationABC.DEF.GHI&expires=1748700000&uid=42">Sign in</a></p>
+</body></html>

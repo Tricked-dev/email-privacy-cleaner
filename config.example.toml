@@ -1,0 +1,78 @@
+# Example configuration for email-privacy-cleaner / email-privacy-milter.
+#
+# All keys are optional; the values shown are the built-in defaults.
+# Load with:  --config /etc/email-privacy-cleaner/config.toml
+
+# "enforce"   -> actually rewrite the message body.
+# "report-only" -> compute and emit audit headers, but never modify the body.
+mode = "enforce"
+
+# --- What to clean -----------------------------------------------------------
+
+# Rewrite text/html body parts.
+clean_html = true
+
+# Also strip tracking query params from text/plain parts (conservative;
+# only obvious http(s) URLs are touched). Off by default.
+clean_text_plain = false
+
+# Remove likely tracking pixels / beacons from HTML.
+remove_pixels = true
+
+# Strip known tracking query parameters (utm_*, fbclid, gclid, ...).
+clean_query_params = true
+
+# Unwrap known ESP redirect links *offline* (SendGrid, Mailchimp, HubSpot, ...).
+unwrap_known_redirects = true
+
+# Preserve the pre-cleaning href in a data-original-href attribute.
+preserve_original_href = true
+
+# Debug only: keep removed elements as HTML comments instead of deleting them.
+debug_preserve_removed = false
+
+# --- Failure behaviour -------------------------------------------------------
+
+# fail_open = true  -> on an internal parse error, pass the ORIGINAL message
+#                      through and add an X-Privacy-Cleaner-Error header.
+# fail_open = false -> tempfail (the MTA will retry later).
+fail_open = true
+
+# --- Resource limits (bounded memory / CPU) ----------------------------------
+
+max_message_size = 52428800   # 50 MiB
+max_html_part_size = 8388608  #  8 MiB
+timeout_ms = 1500
+
+# --- Optional network redirect resolver (PHASE 2 — OFF by default) -----------
+#
+# When enabled (requires building with `--features network`), redirects that
+# could not be unwrapped offline may be resolved by following HTTP redirects.
+# Strict SSRF protections always apply: allowlist-only, HEAD-first, no cookies,
+# no auth, no JS, private/loopback/link-local/metadata IPs blocked, max 5 hops.
+network_redirect_resolution = false
+allowlisted_redirect_domains = [
+  # "links.trusted-esp.com",
+]
+
+# --- Customisation lists -----------------------------------------------------
+
+# Links to these domains are neutralised (href set to about:blank). Suffix match.
+blocked_domains = [
+  # "malware.example",
+]
+
+# Extra tracking query params to strip, merged with the built-in list.
+extra_tracking_params = [
+  # "my_custom_tracker",
+]
+
+# Extra tracking-pixel host suffixes to drop, merged with the built-in list.
+extra_pixel_domains = [
+  # "beacon.mycorp.example",
+]
+
+# --- Milter daemon -----------------------------------------------------------
+
+# TCP address the milter listens on (Stalwart connects here).
+listen = "127.0.0.1:11333"

@@ -1,0 +1,56 @@
+[package]
+name = "email_privacy_cleaner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Email privacy sanitizer library + milter daemon for Stalwart Mail Server. Strips tracking pixels, cleans tracking query params, and unwraps ESP redirect links offline."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tricked-dev/mail-milter"
+readme = "README.md"
+keywords = ["email", "milter", "privacy", "tracking", "stalwart"]
+categories = ["email", "command-line-utilities"]
+
+[lib]
+name = "email_privacy_cleaner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "email-privacy-cleaner"
+path = "src/bin/email-privacy-cleaner.rs"
+
+[[bin]]
+name = "email-privacy-milter"
+path = "src/bin/email-privacy-milter.rs"
+
+[features]
+default = []
+# Optional, opt-in network redirect resolver (phase 2). Disabled by default.
+network = ["dep:ureq"]
+
+[dependencies]
+mail-parser = "0.11"
+lol_html = "2"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+quoted_printable = "0.5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+# Only pulled in when the `network` feature is enabled.
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+# Used by the integration tests to build encoded fixtures and re-parse output.
+url = "2"
+mail-parser = "0.11"
+base64 = "0.22"
+quoted_printable = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
