@@ -214,6 +214,81 @@ break, malformed HTML, quoted-printable and base64 HTML parts, a non-UTF-8
 redirects, private-IP redirect destinations, attachment preservation, and a
 full milter-protocol conversation over a real socket.
 
+## Nix / NixOS
+
+This repo ships a production-grade flake (`flake.nix` + `nix/`).
+
+### Build & run
+
+```bash
+nix build                       # ./result/bin/{...} — network resolver enabled
+nix run  .#milter -- --listen 127.0.0.1:11333
+nix run  .#cli    -- explain-url "https://..."
+```
+
+The flake exposes a **single build target with the network resolver compiled
+in**. To get a fully offline binary, override the cargo feature list:
+
+```bash
+nix build --impure --expr \
+  '(builtins.getFlake (toString ./.)).packages.${builtins.currentSystem}.default.override { cargoFeatures = []; }'
+# or from an overlay / nixpkgs:
+#   pkgs.email-privacy-cleaner.override { cargoFeatures = [ ]; }
+```
+
+Builds use [crane](https://github.com/ipetkov/crane) with a pinned stable
+toolchain. Release binaries are stripped, and the source tree and compiler
+wrapper are scrubbed from / asserted absent in the runtime closure
+(`remove-references-to` + `disallowedReferences`). There are **no native
+runtime dependencies** in either case — the network resolver's TLS is
+rustls/ring, not OpenSSL.
+
+### Checks & dev shell
+
+```bash
+nix flake check     # clippy (-D warnings), rustfmt, full test suite, module build
+nix develop         # dev shell: toolchain + rust-analyzer + cargo-audit/-edit
+```
+
+`direnv allow` will auto-enter the dev shell via `.envrc`.
+
+### NixOS module
+
+Add the flake and import the module:
+
+```nix
+{
+  inputs.email-privacy-cleaner.url = "github:tricked-dev/mail-milter";
+
+  outputs = { nixpkgs, email-privacy-cleaner, ... }: {
+    nixosConfigurations.mail = nixpkgs.lib.nixosSystem {
+      modules = [
+        email-privacy-cleaner.nixosModules.default
+        {
+          services.email-privacy-milter = {
+            enable = true;
+            listen = "127.0.0.1:11333";
+            settings = {
+              mode = "report-only";        # flip to "enforce" once verified
+              remove_pixels = true;
+              clean_query_params = true;
+              extra_tracking_params = [ "my_custom_tracker" ];
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The module renders `settings` to a TOML config (or accepts a `configFile`) and
+runs the daemon as a hardened, stateless systemd service (`DynamicUser`,
+`ProtectSystem=strict`, locked-down syscall/address-family filters, no
+capabilities, loopback-only egress when listening on localhost). Point Stalwart
+at the configured `listen` address as shown in
+[Stalwart integration](#stalwart-integration).
+
 ## License
 
 MIT OR Apache-2.0
