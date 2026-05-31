@@ -221,18 +221,27 @@ This repo ships a production-grade flake (`flake.nix` + `nix/`).
 ### Build & run
 
 ```bash
-nix build                       # offline build -> ./result/bin/{...}
-nix build .#email-privacy-cleaner-network   # with the opt-in network resolver
+nix build                       # ./result/bin/{...} — network resolver enabled
 nix run  .#milter -- --listen 127.0.0.1:11333
 nix run  .#cli    -- explain-url "https://..."
+```
+
+The flake exposes a **single build target with the network resolver compiled
+in**. To get a fully offline binary, override the cargo feature list:
+
+```bash
+nix build --impure --expr \
+  '(builtins.getFlake (toString ./.)).packages.${builtins.currentSystem}.default.override { cargoFeatures = []; }'
+# or from an overlay / nixpkgs:
+#   pkgs.email-privacy-cleaner.override { cargoFeatures = [ ]; }
 ```
 
 Builds use [crane](https://github.com/ipetkov/crane) with a pinned stable
 toolchain. Release binaries are stripped, and the source tree and compiler
 wrapper are scrubbed from / asserted absent in the runtime closure
-(`remove-references-to` + `disallowedReferences`). The default build has **no
-native runtime dependencies** (TLS in the `network` variant is rustls/ring, not
-OpenSSL).
+(`remove-references-to` + `disallowedReferences`). There are **no native
+runtime dependencies** in either case — the network resolver's TLS is
+rustls/ring, not OpenSSL.
 
 ### Checks & dev shell
 

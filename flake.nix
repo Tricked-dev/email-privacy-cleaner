@@ -26,19 +26,15 @@
     let
       # System-independent outputs.
       systemIndependent = {
-        # Drop-in overlay: `pkgs.email-privacy-cleaner` (offline build) and
-        # `pkgs.email-privacy-cleaner-network` (with the opt-in resolver).
+        # Drop-in overlay. The network resolver is the only build target; for a
+        # fully offline binary, override the feature list:
+        #   pkgs.email-privacy-cleaner.override { cargoFeatures = [ ]; }
         # Uses the consumer's own Rust toolchain so the overlay carries no
         # dependency on rust-overlay being applied downstream.
         overlays.default = final: prev: {
           email-privacy-cleaner = final.callPackage ./nix/package.nix {
             craneLib = crane.mkLib final;
             src = ./.;
-          };
-          email-privacy-cleaner-network = final.callPackage ./nix/package.nix {
-            craneLib = crane.mkLib final;
-            src = ./.;
-            cargoFeatures = [ "network" ];
           };
         };
 
@@ -67,30 +63,28 @@
 
           src = ./.;
 
-          # Shared crane arguments so the package, the checks and the
-          # dependency cache all agree.
+          # Shared crane arguments so the checks and the dependency cache all
+          # agree. `--all-features` builds the network resolver (the shipped
+          # target), so the cached deps cover ureq/rustls for every check.
           commonArgs = {
             inherit src;
             pname = "email-privacy-cleaner";
             version = (lib.importTOML ./Cargo.toml).package.version;
             strictDeps = true;
+            cargoExtraArgs = "--all-features";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-          callPackage = pkgs.callPackage;
-          mkPkg =
-            cargoFeatures:
-            callPackage ./nix/package.nix {
-              inherit craneLib src cargoFeatures;
-            };
-
-          email-privacy-cleaner = mkPkg [ ];
-          email-privacy-cleaner-network = mkPkg [ "network" ];
+          # Network resolver is the only target; `.override { cargoFeatures = [ ]; }`
+          # yields a fully offline binary.
+          email-privacy-cleaner = pkgs.callPackage ./nix/package.nix {
+            inherit craneLib src;
+          };
         in
         {
           packages = {
             default = email-privacy-cleaner;
-            inherit email-privacy-cleaner email-privacy-cleaner-network;
+            inherit email-privacy-cleaner;
           };
 
           apps = {
@@ -110,17 +104,19 @@
 
           # `nix flake check` gates the package on the same quality bar as CI.
           checks = {
-            inherit email-privacy-cleaner email-privacy-cleaner-network;
+            inherit email-privacy-cleaner;
 
-            # Full unit + integration + milter-protocol test suite.
+            # Full unit + integration + milter-protocol test suite, exercising
+            # the network feature (the shipped target).
             tests = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
 
-            # Lint with all targets/features; warnings are errors.
+            # Lint all targets; warnings are errors. (Features come from
+            # commonArgs.cargoExtraArgs.)
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
               }
             );
 

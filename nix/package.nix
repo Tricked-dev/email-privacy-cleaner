@@ -9,10 +9,11 @@
   craneLib,
   # Build-time only; removed from the runtime closure afterwards.
   removeReferencesTo,
-  # Cargo feature flags to compile in. The default build is fully offline and
-  # has no native runtime dependencies; "network" pulls in the SSRF-guarded
-  # resolver (ureq + rustls/ring, still no OpenSSL).
-  cargoFeatures ? [ ],
+  # Cargo feature flags to compile in. Defaults to the SSRF-guarded network
+  # resolver (ureq + rustls/ring, still no OpenSSL) — this is the only build
+  # target the flake exposes. For a fully offline binary, override it:
+  #   pkgs.email-privacy-cleaner.override { cargoFeatures = [ ]; }
+  cargoFeatures ? [ "network" ],
   # Source root (the repository). Passed in so the expression has no implicit
   # dependency on its own location.
   src,
