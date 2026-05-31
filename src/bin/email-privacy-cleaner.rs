@@ -188,7 +188,8 @@ fn read_stdin_bytes() -> Result<Vec<u8>, String> {
 
 fn explain_url(url: &Url, cfg: &CleanerConfig) {
     println!("input:    {url}");
-    let provider = email_privacy_cleaner::redirect::detect_provider(url);
+    let ruleset = cfg.ruleset();
+    let provider = ruleset.detect_provider(url.as_str());
     println!("provider: {}", provider.unwrap_or("(none recognised)"));
 
     let unwrap = unwrap_redirect_url(url, cfg);
@@ -220,9 +221,7 @@ fn message_sender_domain(message: &mail_parser::Message<'_>) -> Option<String> {
 }
 
 /// Collect the http(s) unsubscribe targets as a lookup set.
-fn unsubscribe_http_set(
-    message: &mail_parser::Message<'_>,
-) -> std::collections::HashSet<String> {
+fn unsubscribe_http_set(message: &mail_parser::Message<'_>) -> std::collections::HashSet<String> {
     email_privacy_cleaner::mime::extract_unsubscribe_urls(message)
         .into_iter()
         .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
@@ -327,7 +326,7 @@ fn classify_link(
     if unwrap.unwrapped {
         return format!(
             "UNWRAP [{}] -> {}",
-            unwrap.provider.unwrap_or("?"),
+            unwrap.provider.as_deref().unwrap_or("?"),
             unwrap.url
         );
     }
@@ -340,7 +339,10 @@ fn classify_link(
     }
     let cleaned = clean_url(&url, cfg);
     if cleaned.changed {
-        return format!("CLEAN (stripped {:?}) -> {}", cleaned.removed_params, cleaned.url);
+        return format!(
+            "CLEAN (stripped {:?}) -> {}",
+            cleaned.removed_params, cleaned.url
+        );
     }
     "unchanged".into()
 }
@@ -353,6 +355,7 @@ fn print_trackers(raw: &[u8], cfg: &CleanerConfig) -> Result<(), String> {
 
     let mut param_trackers = 0usize;
     let mut wrappers = 0usize;
+    let ruleset = eff.ruleset();
 
     for html in html_parts(&message) {
         for href in email_privacy_cleaner::html::extract_links(html) {
@@ -363,7 +366,7 @@ fn print_trackers(raw: &[u8], cfg: &CleanerConfig) -> Result<(), String> {
             if sensitive.contains(url.as_str()) {
                 continue;
             }
-            if let Some(p) = email_privacy_cleaner::redirect::detect_provider(&url) {
+            if let Some(p) = ruleset.detect_provider(url.as_str()) {
                 wrappers += 1;
                 println!("[redirect:{p}] {url}");
             }

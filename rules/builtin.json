@@ -1,0 +1,259 @@
+{
+  "_comment": "Built-in rule pack for email-privacy-cleaner, authored in the ClearURLs data format (https://docs.clearurls.xyz). This file is original work licensed under the crate's MIT OR Apache-2.0 terms; it is NOT derived from the (copyleft) ClearURLs rules. External ClearURLs-format packs can be loaded to augment it via `rule_packs` / `rule_pack_urls`.",
+  "providers": {
+    "globalRules": {
+      "urlPattern": "^https?://",
+      "completeProvider": false,
+      "rules": [
+        "utm_.*",
+        "fbclid",
+        "gclid",
+        "dclid",
+        "msclkid",
+        "twclid",
+        "igshid",
+        "rb_clickid",
+        "vero_id",
+        "mc_cid",
+        "mc_eid",
+        "mkt_tok",
+        "_hsenc",
+        "_hsmi",
+        "hsa_.*",
+        "ga_(source|medium|term|content|campaign)",
+        "pk_campaign",
+        "pk_kwd",
+        "piwik_campaign",
+        "piwik_kwd",
+        "mtm_.*",
+        "spm",
+        "ref",
+        "ref_src",
+        "source",
+        "campaign"
+      ]
+    },
+    "amazon": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:amazon(?:\\.[a-z]{2,}){1,}|amzn\\.to)",
+      "completeProvider": false,
+      "rules": [
+        "p[fd]_rd_[a-z]*",
+        "_encoding",
+        "psc",
+        "qid",
+        "srs?",
+        "sprefix",
+        "crid",
+        "dib",
+        "dib_tag",
+        "content-id",
+        "linkcode",
+        "tag",
+        "ascsubtag",
+        "smid",
+        "spia",
+        "linkid",
+        "creativeasin",
+        "creative",
+        "camp"
+      ]
+    },
+    "youtube": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:youtube(?:-nocookie)?\\.com|youtu\\.be)",
+      "completeProvider": false,
+      "rules": ["si", "feature", "pp", "kw"]
+    },
+    "ebay": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?ebay(?:\\.[a-z]{2,}){1,}",
+      "completeProvider": false,
+      "rules": [
+        "_trkparms",
+        "_trksid",
+        "_from",
+        "hash",
+        "ul_noapp",
+        "mkcid",
+        "mkrid",
+        "mkevt",
+        "campid",
+        "toolid",
+        "customid",
+        "siteid",
+        "amdata"
+      ]
+    },
+    "google": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?google(?:\\.[a-z]{2,}){1,}",
+      "completeProvider": false,
+      "rules": [
+        "ved",
+        "ei",
+        "gs_l",
+        "gs_lcp",
+        "sa",
+        "oq",
+        "sclient",
+        "uact",
+        "sxsrf",
+        "gws_rd",
+        "gbv",
+        "sourceid",
+        "dpr"
+      ],
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?google(?:\\.[a-z]{2,}){1,}/url\\?.*?(?:url|q)=(https?[^&]+)"
+      ]
+    },
+    "twitter": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:twitter\\.com|x\\.com|t\\.co)",
+      "completeProvider": false,
+      "rules": ["s", "t", "ref_src", "ref_url", "cn", "refsrc"]
+    },
+    "facebook": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:facebook\\.com|fb\\.com|fb\\.watch)",
+      "completeProvider": false,
+      "rules": ["mibextid", "comment_tracking", "rdid", "share_url", "refsrc", "hrc"],
+      "redirections": [
+        "^https?://l[a-z]?\\.facebook\\.com/l\\.php\\?.*?u=(https?%3A%2F%2F[^&]*)"
+      ]
+    },
+    "instagram": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?instagram\\.com",
+      "completeProvider": false,
+      "rules": ["igsh", "img_index"]
+    },
+    "linkedin": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:linkedin\\.com|lnkd\\.in)",
+      "completeProvider": false,
+      "rules": ["trk", "trkinfo", "originalsubdomain", "midtoken", "eid", "otptoken", "li_fat_id", "refid"]
+    },
+    "reddit": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:reddit\\.com|redd\\.it)",
+      "completeProvider": false,
+      "rules": ["share_id", "correlation_id", "ref_source", "ref_campaign", "rdt", "web_only", "deep_link"],
+      "redirections": [
+        "^https?://out\\.reddit\\.com/.*?url=([^&]*)",
+        "^https?://click\\.redditmail\\.com/.*?url=([^&]*)"
+      ]
+    },
+    "tiktok": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?tiktok\\.com",
+      "completeProvider": false,
+      "rules": ["_t", "_r", "is_copy_url", "is_from_webapp", "sender_device", "sender_web_id"]
+    },
+    "spotify": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?spotify\\.com",
+      "completeProvider": false,
+      "rules": ["si", "nd", "context"]
+    },
+    "aliexpress": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?aliexpress\\.(?:com|us)",
+      "completeProvider": false,
+      "rules": ["spm", "scm", "pvid", "algo_pvid", "algo_expid", "btsid", "ws_ab_test", "gatewayadapt"]
+    },
+    "medium": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?medium\\.com",
+      "completeProvider": false,
+      "rules": ["source", "sk"]
+    },
+
+    "sendgrid": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?sendgrid\\.net",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?sendgrid\\.net/ls/click\\?.*?url=([^&]*)"
+      ]
+    },
+    "hubspot": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:hubspotlinks\\.com|hs-sites\\.com|hubspotemail\\.net)",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?hubspotlinks\\.com/c\\?.*?url=([^&]*)"
+      ]
+    },
+    "mailchimp": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?list-manage\\.com/track/click",
+      "completeProvider": false
+    },
+    "mandrill": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?mandrillapp\\.com/track/click",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?mandrillapp\\.com/track/click.*?[?&]url=([^&]*)"
+      ]
+    },
+    "constantcontact": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?rs6\\.net/tn\\.jsp",
+      "completeProvider": false
+    },
+    "iterable": {
+      "urlPattern": "^https?://links\\.iterable\\.com",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://links\\.iterable\\.com/.*?[?&]url=([^&]*)"
+      ]
+    },
+    "klaviyo": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:klaviyo\\.com|klclick\\.com)",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?(?:klaviyo\\.com|klclick\\.com)/.*?[?&]url=([^&]*)"
+      ]
+    },
+    "sparkpost": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?spgo\\.io",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?spgo\\.io/.*?[?&]url=([^&]*)"
+      ]
+    },
+    "postmark": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?pstmrk\\.it",
+      "completeProvider": false
+    },
+    "mailgun": {
+      "urlPattern": "^https?://email\\.[a-z0-9-]+\\.mailgun\\.org",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://email\\.[a-z0-9-]+\\.mailgun\\.org/.*?[?&]url=([^&]*)"
+      ]
+    },
+
+    "doubleclick": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?doubleclick\\.net",
+      "completeProvider": true
+    },
+    "google-analytics": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?google-analytics\\.com",
+      "completeProvider": true
+    },
+    "googletagmanager": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?googletagmanager\\.com",
+      "completeProvider": true
+    },
+    "convertkit": {
+      "urlPattern": "^https?://(?:open|click)\\.convertkit-mail\\.com",
+      "completeProvider": true
+    },
+    "krxd": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?krxd\\.net",
+      "completeProvider": true
+    },
+    "mathtag": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?mathtag\\.com",
+      "completeProvider": true
+    },
+    "linkedin-px": {
+      "urlPattern": "^https?://px\\.ads\\.linkedin\\.com",
+      "completeProvider": true
+    },
+    "pinterest-ct": {
+      "urlPattern": "^https?://ct\\.pinterest\\.com",
+      "completeProvider": true
+    },
+    "activecampaign": {
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?trackcmp\\.net",
+      "completeProvider": true
+    }
+  }
+}

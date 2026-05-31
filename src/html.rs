@@ -251,9 +251,10 @@ fn is_tracking_pixel(el: &lol_html::html_content::Element, config: &CleanerConfi
     };
     let is_remote = remote_host.is_some();
 
-    // Known beacon/tracking host → always drop.
+    // Known beacon/tracking host (rule-pack completeProvider or extra_pixel_domains)
+    // → always drop.
     if let Some(host) = &remote_host {
-        if config.is_pixel_domain(host) {
+        if config.is_beacon(src, host) {
             return true;
         }
     }

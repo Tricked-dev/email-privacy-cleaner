@@ -23,10 +23,14 @@ remove_pixels = true
 # Entries in extra_tracking_params may end with '*' to match by prefix.
 clean_query_params = true
 
-# Apply the hardcoded, host-specific vendor rule table (Amazon `ref`/`pf_rd_*`,
-# YouTube `si`, eBay `_trkparms`, Twitter/X `s`/`t`, LinkedIn `trk`, ...).
-# These only strip a parameter when the URL's host matches that vendor.
+# Apply host-specific (non-global) provider rules from the rule pack (Amazon
+# `pf_rd_*`, YouTube `si`, eBay `_trkparms`, Twitter/X `s`/`t`, LinkedIn `trk`,
+# ...). When false, only the global tracking params are stripped.
 apply_vendor_rules = true
+
+# Also strip referral-marketing params (provider `referralMarketing` rules).
+# Off by default, since some recipients want affiliate/referral credit.
+strip_referral_marketing = false
 
 # Unwrap known ESP redirect links *offline* (SendGrid, Mailchimp, HubSpot, ...).
 unwrap_known_redirects = true
@@ -102,6 +106,28 @@ extra_tracking_params = [
 # Extra tracking-pixel host suffixes to drop, merged with the built-in list.
 extra_pixel_domains = [
   # "beacon.mycorp.example",
+]
+
+# --- External rule packs (ClearURLs format) ---------------------------------
+#
+# The built-in rules ship as a ClearURLs-format JSON document compiled into the
+# binary (rules/builtin.json). You can layer additional ClearURLs-format packs
+# on top — including the upstream ClearURLs data.min.json — to extend coverage
+# without code changes. Loaded packs AUGMENT the built-ins (union of providers).
+#
+# NOTE: the upstream ClearURLs rules are copyleft (LGPL); this crate ships only
+# the parser, not that data. Download and point at it yourself if you want it.
+# Patterns using regex features unsupported by Rust's linear-time engine are
+# skipped individually; the rest of the pack still loads.
+rule_packs = [
+  # "/etc/email-privacy-cleaner/clearurls.data.min.json",
+]
+
+# Pack URLs are fetched once at startup. Only honoured when built with the
+# `network` feature; ignored otherwise. (This is a startup download, not part
+# of the per-message cleaning path, which remains fully offline.)
+rule_pack_urls = [
+  # "https://rules2.clearurls.xyz/data.min.json",
 ]
 
 # --- Milter daemon -----------------------------------------------------------

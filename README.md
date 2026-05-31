@@ -10,9 +10,9 @@ It performs these independent, deterministic, **offline** transformations:
 1. **Tracking-pixel removal** — drops 1×1 / hidden / known-beacon `<img>` tags.
 2. **Tracking query-parameter stripping** — `utm_*`, `fbclid`, `gclid`,
    `mc_cid`, `_hsenc`, … (configurable, case-insensitive; `prefix*` supported).
-3. **Vendor-specific URL cleaning** — host-scoped ClearURLs-style rules for
-   Amazon (`ref`, `pf_rd_*`, `tag`, …), YouTube (`si`), eBay (`_trkparms`),
-   Twitter/X, LinkedIn, Reddit, TikTok and more (see `src/vendor.rs`).
+3. **Vendor-specific URL cleaning** — host-scoped rules for Amazon (`pf_rd_*`,
+   `tag`, …), YouTube (`si`), eBay (`_trkparms`), Twitter/X, LinkedIn, Reddit,
+   TikTok and more, shipped in the built-in rule pack.
 4. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
    Constant Contact, HubSpot, Customer.io, Iterable, Klaviyo, Mailgun,
    Brevo/Sendinblue, Postmark, SparkPost — **only** when the destination is
@@ -40,8 +40,8 @@ cargo feature; it is disabled by default and heavily SSRF-guarded.
 
 ```
 email_privacy_cleaner          (library crate)
-├── config        CleanerConfig (TOML), tracking tables, sender policies
-├── vendor        host-scoped vendor URL rule table (Amazon, YouTube, …)
+├── config        CleanerConfig (TOML), sender policies, rule-pack loading
+├── ruleset       ClearURLs-format rule engine (built-in + external packs)
 ├── url_clean     clean_url()              — query-param + vendor stripping
 ├── redirect      unwrap_redirect_url()    — offline ESP unwrapping
 ├── validate      destination validation + SSRF IP blocking
@@ -213,7 +213,8 @@ default. Highlights:
 | `clean_text_plain` | `false` | query-clean text/plain parts |
 | `remove_pixels` | `true` | drop tracking pixels |
 | `clean_query_params` | `true` | strip tracking params |
-| `apply_vendor_rules` | `true` | host-scoped vendor URL rules |
+| `apply_vendor_rules` | `true` | host-scoped (non-global) rule-pack rules |
+| `strip_referral_marketing` | `false` | also strip `referralMarketing` params |
 | `unwrap_known_redirects` | `true` | offline ESP unwrapping |
 | `protect_sensitive_senders` | `true` | skip link rewriting for auth/payment senders |
 | `surface_unsubscribe` | `true` | add `X-Privacy-Cleaner-Unsubscribe` header |
@@ -226,6 +227,33 @@ default. Highlights:
 | `blocked_domains` | `[]` | links neutralised to `about:blank` |
 | `extra_tracking_params` | `[]` | merged with built-ins (`prefix*` allowed) |
 | `extra_pixel_domains` | `[]` | merged with built-ins |
+| `rule_packs` | `[]` | external ClearURLs-format pack files to merge |
+| `rule_pack_urls` | `[]` | pack URLs (fetched at startup; `network` feature only) |
+
+## Rule packs (ClearURLs format)
+
+The default tracking params, vendor rules, ESP redirect unwrappers and known
+beacon hosts ship as a **ClearURLs-format JSON document** compiled into the
+binary ([`rules/builtin.json`](rules/builtin.json)) — original work under this
+crate's MIT/Apache licence. The same parser loads **external packs** (file paths
+via `rule_packs`, or URLs via `rule_pack_urls` with the `network` feature) and
+**merges** them on top of the built-ins, so coverage can be extended without
+code changes — including with the upstream [ClearURLs](https://clearurls.xyz)
+`data.min.json`.
+
+Supported per provider: `urlPattern`, `rules` (param-name regexes),
+`referralMarketing`, `rawRules`, `exceptions`, `redirections` (capture group 1
+is the embedded destination, always re-validated by `validate` before any link
+is rewritten), and `completeProvider` (treated as a beacon-host signal for
+tracking-pixel detection only — **never** used to neutralise an `<a>` link, so
+click-throughs are never broken). Regexes compile with the linear-time `regex`
+crate (no catastrophic backtracking); patterns using unsupported features (e.g.
+lookaround in a third-party pack) are skipped individually while the rest of the
+pack still loads.
+
+> The upstream ClearURLs rules are copyleft (LGPL); this crate ships only the
+> parser, not that data. Download it and point `rule_packs`/`rule_pack_urls` at
+> it if you want it.
 
 ## Security model
 

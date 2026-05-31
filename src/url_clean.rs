@@ -19,11 +19,12 @@ pub struct UrlCleanResult {
 /// Remove known tracking query parameters from `url`.
 ///
 /// Parameter *names* are matched case-insensitively. Removal combines the
-/// global tracking-param table with the host-specific
-/// [`vendor`](crate::vendor) rules (when `config.apply_vendor_rules` is set).
-/// The raw encoding of the surviving parameters is preserved byte-for-byte so
-/// we don't accidentally re-encode values (which could break signed/magic
-/// links).
+/// user-supplied global params (`extra_tracking_params`) with the rule pack:
+/// global rules always apply, host-specific (vendor) rules apply when
+/// `apply_vendor_rules` is set, and referral-marketing rules apply when
+/// `strip_referral_marketing` is set. The raw encoding of the surviving
+/// parameters is preserved byte-for-byte so we don't accidentally re-encode
+/// values (which could break signed/magic links).
 pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
     let query = match url.query() {
         Some(q) if !q.is_empty() => q,
@@ -36,7 +37,17 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
         }
     };
 
-    let host = url.host_str().unwrap_or("");
+    let ruleset = config.ruleset();
+    let url_str = url.as_str();
+
+    // A provider exception means "leave this URL exactly as-is".
+    if ruleset.is_exception(url_str) {
+        return UrlCleanResult {
+            url: url.clone(),
+            changed: false,
+            removed_params: Vec::new(),
+        };
+    }
 
     let mut kept: Vec<&str> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
@@ -51,9 +62,12 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
         let key = percent_decode_str(&key_plus).decode_utf8_lossy();
 
         let is_tracker = config.is_tracking_param(&key)
-            || (config.apply_vendor_rules
-                && !host.is_empty()
-                && crate::vendor::is_vendor_tracking_param(host, &key));
+            || ruleset.param_is_tracking(
+                url_str,
+                &key,
+                config.apply_vendor_rules,
+                config.strip_referral_marketing,
+            );
 
         if is_tracker {
             removed.push(key.into_owned());
