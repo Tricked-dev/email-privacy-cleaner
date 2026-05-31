@@ -1,0 +1,27 @@
+From: Acme Newsletter <news@acme.example>
+To: Recipient <user@example.org>
+Subject: Your weekly digest
+Date: Sat, 31 May 2026 10:00:00 +0000
+Message-ID: <abc123@acme.example>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="=_boundary_alt_42"
+
+--=_boundary_alt_42
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Read more at https://shop.acme.example/article?id=5&utm_source=newsletter&utm_medium=email
+
+--=_boundary_alt_42
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html>
+<body>
+<p>Hello! <a href="https://shop.acme.example/article?id=5&utm_source=newsletter&utm_medium=email">Read more</a></p>
+<img src="https://track.acme.example/open.gif?u=123" width="1" height="1" alt="">
+<img src="https://cdn.acme.example/logo.png" width="180" height="50" alt="Acme">
+</body>
+</html>
+
+--=_boundary_alt_42--

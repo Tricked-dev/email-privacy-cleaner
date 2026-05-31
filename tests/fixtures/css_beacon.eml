@@ -1,0 +1,14 @@
+From: Sender <s@example.com>
+To: User <user@example.org>
+Subject: CSS beacons and link pings
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p>Welcome.</p>
+<div style="display:none;background-image:url('https://google-analytics.com/collect?v=1')"></div>
+<table background="https://doubleclick.net/open.gif"><tr><td>spacer</td></tr></table>
+<div style="width:600px;height:200px;background:url(https://cdn.example.com/hero.jpg) no-repeat">Hero</div>
+<a href="https://shop.example.com/deal?id=1&utm_source=news" ping="https://track.example.net/c?l=1">Shop</a>
+</body></html>

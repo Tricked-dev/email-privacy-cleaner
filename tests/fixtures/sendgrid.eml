@@ -1,0 +1,10 @@
+From: Store <store@shop.example>
+To: User <user@example.org>
+Subject: SendGrid tracked links
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p><a href="https://u1234.ct.sendgrid.net/ls/click?upn=abcdef&url=https%3A%2F%2Fwww.example.com%2Fdeals%3Futm_source%3Demail%26utm_campaign%3Dspring">See the deals</a></p>
+</body></html>

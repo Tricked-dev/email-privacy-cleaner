@@ -1,0 +1,11 @@
+From: Marketing <hello@brand.example>
+To: User <user@example.org>
+Subject: HubSpot tracked link
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p><a href="https://link.hubspotlinks.com/c?url=https%3A%2F%2Fblog.brand.example%2Fpost%3F_hsenc%3Dxyz%26_hsmi%3D42&data=abc">Read the post</a></p>
+<p><a href="https://blog.brand.example/post?_hsenc=token123&_hsmi=42&id=7">Direct link</a></p>
+</body></html>

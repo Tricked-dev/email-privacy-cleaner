@@ -1,0 +1,11 @@
+From: Deals <deals@retail.example>
+To: User <user@example.org>
+Subject: Vendor-specific tracking params
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p><a href="https://www.amazon.com/dp/B0EXAMPLE?ref=foo&pf_rd_r=ABC123&pd_rd_w=zzz&tag=aff-20&th=1&keywords=usb+cable">Buy now</a></p>
+<p><a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=TRACKINGID&t=42">Watch</a></p>
+</body></html>

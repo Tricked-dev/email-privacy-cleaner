@@ -1,0 +1,15 @@
+# Keep the build context tight. The multi-stage `Dockerfile` only needs
+# Cargo.{toml,lock} + src/ + rules/. `Dockerfile.prebuild` only needs the
+# two binaries that CI drops into the context root + the Dockerfile itself.
+
+target/
+.git/
+.github/
+examples/
+tests/
+nix/
+flake.nix
+flake.lock
+*.md
+config.example.toml
+.dockerignore

@@ -1,0 +1,43 @@
+# Prebuilt-binary runtime image used by the GHCR workflow.
+#
+# CI compiles the release binaries on the GitHub runner (faster, leverages the
+# Rust cargo cache action) and copies them into the build context next to this
+# Dockerfile. For a "build everything in Docker" local flow, use the
+# multi-stage `Dockerfile` instead.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user. Mail-milter doesn't need any state, but a writable
+# home is handy for an optional TOML config bind-mount.
+RUN groupadd --gid 1000 cleaner \
+    && useradd --uid 1000 --home-dir /app --create-home --gid cleaner cleaner
+
+# Drop the prebuilt binaries into PATH. Owned by root, mode 755 — readable
+# and executable by the non-root user we switch to below.
+COPY email-privacy-milter  /usr/local/bin/email-privacy-milter
+COPY email-privacy-cleaner /usr/local/bin/email-privacy-cleaner
+RUN chmod 0755 /usr/local/bin/email-privacy-milter /usr/local/bin/email-privacy-cleaner
+
+LABEL org.opencontainers.image.title="email-privacy-cleaner" \
+      org.opencontainers.image.description="Pre-queue email privacy milter for Stalwart Mail Server. Strips tracking pixels, cleans tracking query params, unwraps ESP redirect links." \
+      org.opencontainers.image.source="https://github.com/tricked-dev/email-privacy-cleaner" \
+      org.opencontainers.image.documentation="https://github.com/tricked-dev/email-privacy-cleaner#readme" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.vendor="tricked-dev"
+
+USER cleaner
+WORKDIR /app
+
+EXPOSE 11333/tcp
+
+# Default: run the milter daemon, binding to all interfaces inside the
+# container. Override the entrypoint to invoke the CLI instead:
+#   docker run --rm -i \
+#     --entrypoint /usr/local/bin/email-privacy-cleaner \
+#     ghcr.io/tricked-dev/email-privacy-cleaner clean-message < raw.eml
+ENTRYPOINT ["/usr/local/bin/email-privacy-milter"]
+CMD ["--listen", "0.0.0.0:11333"]
