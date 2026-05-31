@@ -5,6 +5,7 @@
 //! so the library can be used without any config file.
 
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -125,6 +126,96 @@ pub const DEFAULT_PIXEL_DOMAINS: &[&str] = &[
     "t.signaux.example", // placeholder kept short; extend via extra_pixel_domains
 ];
 
+/// Built-in "sensitive sender" domains. Mail from these senders frequently
+/// carries security-critical links (password resets, magic-login tokens, 2FA,
+/// payment confirmations) whose query parameters must **not** be rewritten or
+/// unwrapped, lest a login/verification flow break.
+///
+/// When [`CleanerConfig::protect_sensitive_senders`] is enabled (the default),
+/// a message whose `From:` domain matches one of these has query-param cleaning
+/// and redirect unwrapping disabled — pixel removal still applies, since it is
+/// always safe. Extend the set per deployment via a [`SenderPolicy`].
+pub const DEFAULT_SENSITIVE_SENDER_DOMAINS: &[&str] = &[
+    // Identity / SSO
+    "accounts.google.com",
+    "google.com",
+    "login.microsoftonline.com",
+    "microsoft.com",
+    "apple.com",
+    "okta.com",
+    "auth0.com",
+    "duosecurity.com",
+    // Payments / finance
+    "paypal.com",
+    "stripe.com",
+    "wise.com",
+    "revolut.com",
+    "americanexpress.com",
+    "chase.com",
+    "bankofamerica.com",
+    // Auth/notification senders for common services
+    "github.com",
+    "gitlab.com",
+];
+
+/// A per-sender policy override. Rules are matched against the message's `From:`
+/// domain (host-suffix, case-insensitive); the first matching rule applies.
+///
+/// Every toggle is optional: `None` means "inherit the global setting". The
+/// `no_modify` shorthand forces report-only behaviour (audit headers are still
+/// added, but the body is never rewritten) for that sender.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SenderPolicy {
+    /// Sender domains this rule applies to (host-suffix match).
+    pub match_domains: Vec<String>,
+    /// Override the operating mode for matching senders.
+    pub mode: Option<Mode>,
+    /// Shorthand: never modify the body for this sender (implies report-only).
+    pub no_modify: bool,
+    /// Override `clean_html`.
+    pub clean_html: Option<bool>,
+    /// Override `remove_pixels`.
+    pub remove_pixels: Option<bool>,
+    /// Override `clean_query_params`.
+    pub clean_query_params: Option<bool>,
+    /// Override `unwrap_known_redirects`.
+    pub unwrap_known_redirects: Option<bool>,
+}
+
+impl SenderPolicy {
+    fn matches(&self, sender_domain: &str) -> bool {
+        let d = sender_domain.to_ascii_lowercase();
+        self.match_domains
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .any(|s| d == s || d.ends_with(&format!(".{s}")))
+    }
+}
+
+/// Which policy ended up applying to a message — surfaced as the
+/// `X-Privacy-Cleaner-Policy` audit header and used by the CLI explainers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyLabel {
+    /// The global configuration applied unchanged.
+    Default,
+    /// A built-in sensitive-sender protection applied.
+    SensitiveSender,
+    /// A user-defined [`SenderPolicy`] applied (matched on this domain).
+    Custom(String),
+}
+
+impl PolicyLabel {
+    /// Header-safe string form.
+    pub fn as_header(&self) -> String {
+        match self {
+            PolicyLabel::Default => "default".into(),
+            PolicyLabel::SensitiveSender => "sensitive-sender".into(),
+            PolicyLabel::Custom(d) => format!("custom:{d}"),
+        }
+    }
+}
+
 /// Configuration controlling every part of the cleaning pipeline.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -140,6 +231,9 @@ pub struct CleanerConfig {
     pub remove_pixels: bool,
     /// Strip known tracking query parameters from URLs.
     pub clean_query_params: bool,
+    /// Apply the hardcoded vendor-specific URL rule table (Amazon `ref`,
+    /// YouTube `si`, eBay `_trkparms`, …). See [`crate::vendor`].
+    pub apply_vendor_rules: bool,
     /// Unwrap known ESP redirect links offline.
     pub unwrap_known_redirects: bool,
     /// Enable the optional, opt-in network redirect resolver (phase 2).
@@ -148,6 +242,16 @@ pub struct CleanerConfig {
     pub preserve_original_href: bool,
     /// In debug mode, removed tags are kept as HTML comments.
     pub debug_preserve_removed: bool,
+
+    /// Apply the built-in sensitive-sender protection (see
+    /// [`DEFAULT_SENSITIVE_SENDER_DOMAINS`]): for matching senders, query-param
+    /// cleaning and redirect unwrapping are skipped so security links survive.
+    pub protect_sensitive_senders: bool,
+    /// Surface the message's `List-Unsubscribe` HTTP(S) target in an
+    /// `X-Privacy-Cleaner-Unsubscribe` header.
+    pub surface_unsubscribe: bool,
+    /// Per-sender policy overrides, evaluated in order (first match wins).
+    pub sender_policies: Vec<SenderPolicy>,
 
     /// Fail open: on internal errors, return the original message and add an
     /// `X-Privacy-Cleaner-Error` header instead of tempfailing.
@@ -177,6 +281,8 @@ pub struct CleanerConfig {
     #[serde(skip)]
     tracking_params: Option<HashSet<String>>,
     #[serde(skip)]
+    tracking_prefixes: Option<Vec<String>>,
+    #[serde(skip)]
     pixel_domains: Option<Vec<String>>,
 }
 
@@ -188,10 +294,14 @@ impl Default for CleanerConfig {
             clean_text_plain: false,
             remove_pixels: true,
             clean_query_params: true,
+            apply_vendor_rules: true,
             unwrap_known_redirects: true,
             network_redirect_resolution: false,
             preserve_original_href: true,
             debug_preserve_removed: false,
+            protect_sensitive_senders: true,
+            surface_unsubscribe: true,
+            sender_policies: Vec::new(),
             fail_open: true,
             max_message_size: 50 * 1024 * 1024,
             max_html_part_size: 8 * 1024 * 1024,
@@ -202,6 +312,7 @@ impl Default for CleanerConfig {
             extra_pixel_domains: Vec::new(),
             listen: "127.0.0.1:11333".to_string(),
             tracking_params: None,
+            tracking_prefixes: None,
             pixel_domains: None,
         }
     }
@@ -227,14 +338,9 @@ impl CleanerConfig {
     /// lists; [`from_toml_*`](Self::from_toml_str) and the milter/CLI entry
     /// points do this automatically.
     pub fn finalize(&mut self) {
-        let mut set: HashSet<String> = DEFAULT_TRACKING_PARAMS
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        for p in &self.extra_tracking_params {
-            set.insert(p.to_ascii_lowercase());
-        }
+        let (set, prefixes) = self.build_param_tables();
         self.tracking_params = Some(set);
+        self.tracking_prefixes = Some(prefixes);
 
         let mut domains: Vec<String> = DEFAULT_PIXEL_DOMAINS
             .iter()
@@ -246,26 +352,103 @@ impl CleanerConfig {
         self.pixel_domains = Some(domains);
     }
 
-    fn params(&self) -> std::borrow::Cow<'_, HashSet<String>> {
-        match &self.tracking_params {
-            Some(s) => std::borrow::Cow::Borrowed(s),
-            None => {
-                // Lazily compute without mutation (used when finalize() wasn't called).
-                let mut set: HashSet<String> = DEFAULT_TRACKING_PARAMS
-                    .iter()
-                    .map(|s| s.to_ascii_lowercase())
-                    .collect();
-                for p in &self.extra_tracking_params {
-                    set.insert(p.to_ascii_lowercase());
+    /// Build the exact-match set and prefix list of tracking parameter names.
+    /// A configured name ending in `*` (e.g. `mkt_*`) becomes a prefix rule.
+    fn build_param_tables(&self) -> (HashSet<String>, Vec<String>) {
+        let mut set: HashSet<String> = DEFAULT_TRACKING_PARAMS
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let mut prefixes: Vec<String> = Vec::new();
+        for p in &self.extra_tracking_params {
+            let p = p.to_ascii_lowercase();
+            if let Some(stripped) = p.strip_suffix('*') {
+                if !stripped.is_empty() {
+                    prefixes.push(stripped.to_string());
                 }
-                std::borrow::Cow::Owned(set)
+            } else {
+                set.insert(p);
             }
+        }
+        (set, prefixes)
+    }
+
+    fn params(&self) -> Cow<'_, HashSet<String>> {
+        match &self.tracking_params {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(self.build_param_tables().0),
+        }
+    }
+
+    fn param_prefixes(&self) -> Cow<'_, [String]> {
+        match &self.tracking_prefixes {
+            Some(v) => Cow::Borrowed(v),
+            None => Cow::Owned(self.build_param_tables().1),
         }
     }
 
     /// Returns `true` if `name` is a tracking parameter (case-insensitive).
+    /// Matches the exact set and any configured `prefix*` rule.
     pub fn is_tracking_param(&self, name: &str) -> bool {
-        self.params().contains(&name.to_ascii_lowercase())
+        let name = name.to_ascii_lowercase();
+        self.params().contains(&name)
+            || self.param_prefixes().iter().any(|p| name.starts_with(p))
+    }
+
+    /// Resolve the effective configuration for a message from `sender_domain`.
+    ///
+    /// Returns the global config unchanged (borrowed) when no policy applies, or
+    /// an overridden clone together with a [`PolicyLabel`] describing what
+    /// matched. Resolution order: built-in sensitive-sender protection first
+    /// (most conservative), then the first matching user [`SenderPolicy`], which
+    /// may further restrict (or, if desired, re-enable) behaviour.
+    pub fn effective_for_sender(&self, sender_domain: Option<&str>) -> (Cow<'_, CleanerConfig>, PolicyLabel) {
+        let domain = match sender_domain {
+            Some(d) if !d.is_empty() => d,
+            _ => return (Cow::Borrowed(self), PolicyLabel::Default),
+        };
+
+        let mut label = PolicyLabel::Default;
+        let mut cfg: Option<CleanerConfig> = None;
+
+        // Built-in sensitive-sender protection: be conservative.
+        if self.protect_sensitive_senders && is_sensitive_sender(domain) {
+            let c = cfg.get_or_insert_with(|| self.clone());
+            c.clean_query_params = false;
+            c.unwrap_known_redirects = false;
+            c.apply_vendor_rules = false;
+            c.clean_text_plain = false;
+            label = PolicyLabel::SensitiveSender;
+        }
+
+        // First matching user policy wins and overrides the built-in defaults.
+        if let Some(policy) = self.sender_policies.iter().find(|p| p.matches(domain)) {
+            let c = cfg.get_or_insert_with(|| self.clone());
+            if policy.no_modify {
+                c.mode = Mode::ReportOnly;
+            }
+            if let Some(m) = policy.mode {
+                c.mode = m;
+            }
+            if let Some(v) = policy.clean_html {
+                c.clean_html = v;
+            }
+            if let Some(v) = policy.remove_pixels {
+                c.remove_pixels = v;
+            }
+            if let Some(v) = policy.clean_query_params {
+                c.clean_query_params = v;
+            }
+            if let Some(v) = policy.unwrap_known_redirects {
+                c.unwrap_known_redirects = v;
+            }
+            label = PolicyLabel::Custom(domain.to_ascii_lowercase());
+        }
+
+        match cfg {
+            Some(c) => (Cow::Owned(c), label),
+            None => (Cow::Borrowed(self), PolicyLabel::Default),
+        }
     }
 
     /// Returns `true` if `host` matches a known tracking-pixel domain
@@ -308,5 +491,70 @@ impl CleanerConfig {
             .iter()
             .map(|d| d.to_ascii_lowercase())
             .any(|d| host == d || host.ends_with(&format!(".{d}")))
+    }
+}
+
+/// Returns `true` if `sender_domain` matches a built-in sensitive-sender
+/// domain (host-suffix, case-insensitive).
+pub fn is_sensitive_sender(sender_domain: &str) -> bool {
+    let d = sender_domain.to_ascii_lowercase();
+    DEFAULT_SENSITIVE_SENDER_DOMAINS
+        .iter()
+        .any(|s| d == *s || d.ends_with(&format!(".{s}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_extra_param_matches_by_prefix() {
+        let mut c = CleanerConfig {
+            extra_tracking_params: vec!["mkt_*".into(), "exact_one".into()],
+            ..Default::default()
+        };
+        c.finalize();
+        assert!(c.is_tracking_param("mkt_tok"));
+        assert!(c.is_tracking_param("MKT_anything"));
+        assert!(c.is_tracking_param("exact_one"));
+        assert!(!c.is_tracking_param("mkt")); // prefix needs the stem
+        assert!(!c.is_tracking_param("keep_me"));
+    }
+
+    #[test]
+    fn sensitive_sender_protection_disables_link_rewriting() {
+        let mut c = CleanerConfig::default();
+        c.finalize();
+        let (eff, label) = c.effective_for_sender(Some("security.paypal.com"));
+        assert_eq!(label, PolicyLabel::SensitiveSender);
+        assert!(!eff.clean_query_params);
+        assert!(!eff.unwrap_known_redirects);
+        // Pixel removal stays on — it is always safe.
+        assert!(eff.remove_pixels);
+    }
+
+    #[test]
+    fn unknown_sender_uses_global_config_unchanged() {
+        let mut c = CleanerConfig::default();
+        c.finalize();
+        let (eff, label) = c.effective_for_sender(Some("newsletter.example.com"));
+        assert_eq!(label, PolicyLabel::Default);
+        assert!(eff.clean_query_params);
+        assert!(matches!(eff, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn custom_sender_policy_overrides() {
+        let toml = r#"
+            [[sender_policies]]
+            match_domains = ["bank.example"]
+            no_modify = true
+            remove_pixels = false
+        "#;
+        let c = CleanerConfig::from_toml_str(toml).unwrap();
+        let (eff, label) = c.effective_for_sender(Some("mail.bank.example"));
+        assert_eq!(label, PolicyLabel::Custom("mail.bank.example".into()));
+        assert_eq!(eff.mode, Mode::ReportOnly);
+        assert!(!eff.remove_pixels);
     }
 }

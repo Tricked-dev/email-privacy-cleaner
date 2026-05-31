@@ -7,13 +7,15 @@
 //! parts — is preserved verbatim. This keeps the change minimal and avoids
 //! re-serialising (and thus mangling) the whole message.
 
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use std::collections::HashSet;
+
+use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
 use url::Url;
 
 use crate::config::{CleanerConfig, Mode};
 use crate::encoding::{encode_body, reencode_charset};
 use crate::error::{CleanerError, Result};
-use crate::html::clean_html;
+use crate::html::{clean_html_ctx, LinkContext};
 use crate::url_clean::clean_url;
 
 /// Per-message statistics gathered while cleaning.
@@ -71,12 +73,34 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
         .parse(raw)
         .ok_or(CleanerError::MimeParse)?;
 
+    // Resolve the effective configuration for this sender (per-sender policy +
+    // built-in sensitive-sender protection).
+    let sender_domain = sender_domain(&message);
+    let (eff, policy) = config.effective_for_sender(sender_domain.as_deref());
+    let eff: &CleanerConfig = &eff;
+
+    // Links that must never be rewritten (List-Unsubscribe targets carry
+    // recipient-specific tokens).
+    let unsubscribe_urls = extract_unsubscribe_urls(&message);
+    let sensitive: HashSet<String> = unsubscribe_urls
+        .iter()
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .filter_map(|u| Url::parse(u).ok().map(|p| p.to_string()))
+        .collect();
+    let link_ctx = LinkContext {
+        sensitive_urls: if sensitive.is_empty() {
+            None
+        } else {
+            Some(&sensitive)
+        },
+    };
+
     let line_ending = detect_line_ending(raw);
     let mut stats = CleanStats::default();
     let mut replacements: Vec<Replacement> = Vec::new();
 
     // ---- HTML body parts ----
-    if config.clean_html {
+    if eff.clean_html {
         for &part_id in &message.html_body {
             let part = match message.part(part_id) {
                 Some(p) => p,
@@ -90,16 +114,16 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
             };
             stats.html_parts += 1;
 
-            if html.len() > config.max_html_part_size {
+            if html.len() > eff.max_html_part_size {
                 continue;
             }
 
-            let res = clean_html(html, None, config)?;
+            let res = clean_html_ctx(html, None, eff, &link_ctx)?;
             stats.urls_cleaned += res.urls_cleaned;
             stats.redirects_unwrapped += res.redirects_unwrapped;
             stats.pixels_removed += res.pixels_removed;
 
-            if config.mode.is_enforce() && res.changed {
+            if eff.mode.is_enforce() && res.changed {
                 if let Some(rep) = build_replacement(raw, part, res.html.as_bytes(), &line_ending) {
                     replacements.push(rep);
                 }
@@ -108,7 +132,7 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
     }
 
     // ---- text/plain parts (query-param cleaning only) ----
-    if config.clean_text_plain {
+    if eff.clean_text_plain {
         for &part_id in &message.text_body {
             let part = match message.part(part_id) {
                 Some(p) => p,
@@ -118,9 +142,9 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
                 PartType::Text(s) => s.as_ref(),
                 _ => continue,
             };
-            let (new_text, n) = clean_text_urls(text, config);
+            let (new_text, n) = clean_text_urls(text, eff);
             stats.urls_cleaned += n;
-            if config.mode.is_enforce() && n > 0 {
+            if eff.mode.is_enforce() && n > 0 {
                 if let Some(rep) = build_replacement(raw, part, new_text.as_bytes(), &line_ending) {
                     replacements.push(rep);
                 }
@@ -146,7 +170,13 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
     let body = full[split..].to_vec();
 
     // ---- Audit headers ----
-    let audit_headers = build_audit_headers(&stats, config.mode, modified);
+    let mut audit_headers = build_audit_headers(&stats, eff.mode, modified);
+    audit_headers.push(("X-Privacy-Cleaner-Policy".into(), policy.as_header()));
+    if eff.surface_unsubscribe {
+        if let Some(url) = preferred_unsubscribe(&unsubscribe_urls) {
+            audit_headers.push(("X-Privacy-Cleaner-Unsubscribe".into(), url));
+        }
+    }
 
     // ---- Full cleaned message with audit headers inserted ----
     let cleaned = insert_headers(&full, split, &audit_headers, &line_ending);
@@ -157,9 +187,54 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
         audit_headers,
         stats,
         modified,
-        mode: config.mode,
+        mode: eff.mode,
         error: None,
     })
+}
+
+/// Extract the sender domain (lower-cased) from the message `From:` header.
+fn sender_domain(message: &Message<'_>) -> Option<String> {
+    let addr = message.from().and_then(|a| a.first())?.address()?;
+    let (_, domain) = addr.rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain)
+    }
+}
+
+/// Extract the bracketed targets of the `List-Unsubscribe` header, in order.
+/// Returns the raw `<...>` contents (e.g. `https://…`, `mailto:…`).
+pub fn extract_unsubscribe_urls(message: &Message<'_>) -> Vec<String> {
+    let raw = match message.header_raw("List-Unsubscribe") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        match after.find('>') {
+            Some(close) => {
+                let url = after[..close].trim();
+                if !url.is_empty() {
+                    out.push(url.to_string());
+                }
+                rest = &after[close + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Pick the unsubscribe URL to surface: prefer an HTTP(S) one, else the first.
+fn preferred_unsubscribe(urls: &[String]) -> Option<String> {
+    urls.iter()
+        .find(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .or_else(|| urls.first())
+        .cloned()
 }
 
 /// Build the standard audit headers.

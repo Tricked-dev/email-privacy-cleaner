@@ -235,7 +235,7 @@ fn handle_eom(
 
     match clean_message_fail_open(&raw, config) {
         Ok(result) => {
-            emit_modifications(stream, &result, config, caps)?;
+            emit_modifications(stream, &result, caps)?;
             write_packet(stream, SMFIR_CONTINUE, &[])?;
         }
         Err(_) => {
@@ -249,11 +249,12 @@ fn handle_eom(
 fn emit_modifications(
     stream: &mut TcpStream,
     result: &CleanerResult,
-    config: &CleanerConfig,
     caps: Caps,
 ) -> io::Result<()> {
-    // Replace the body only when we actually modified it (enforce mode).
-    if config.mode.is_enforce() && result.modified && caps.can_chgbody {
+    // Replace the body only when we actually modified it. `result.modified`
+    // already reflects the effective (possibly per-sender) mode, so we don't
+    // re-check the global mode here.
+    if result.modified && caps.can_chgbody {
         for chunk in result.body.chunks(REPLBODY_CHUNK) {
             write_packet(stream, SMFIR_REPLBODY, chunk)?;
         }

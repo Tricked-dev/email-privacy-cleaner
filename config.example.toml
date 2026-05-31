@@ -20,7 +20,13 @@ clean_text_plain = false
 remove_pixels = true
 
 # Strip known tracking query parameters (utm_*, fbclid, gclid, ...).
+# Entries in extra_tracking_params may end with '*' to match by prefix.
 clean_query_params = true
+
+# Apply the hardcoded, host-specific vendor rule table (Amazon `ref`/`pf_rd_*`,
+# YouTube `si`, eBay `_trkparms`, Twitter/X `s`/`t`, LinkedIn `trk`, ...).
+# These only strip a parameter when the URL's host matches that vendor.
+apply_vendor_rules = true
 
 # Unwrap known ESP redirect links *offline* (SendGrid, Mailchimp, HubSpot, ...).
 unwrap_known_redirects = true
@@ -30,6 +36,32 @@ preserve_original_href = true
 
 # Debug only: keep removed elements as HTML comments instead of deleting them.
 debug_preserve_removed = false
+
+# --- Sender-aware behaviour --------------------------------------------------
+
+# Protect built-in "sensitive" senders (identity providers, banks, payment and
+# auth services). For matching From: domains, query-param cleaning and redirect
+# unwrapping are skipped so magic-login / 2FA / reset links never break. Pixel
+# removal still applies (always safe).
+protect_sensitive_senders = true
+
+# Surface the message's List-Unsubscribe HTTP(S) target as an
+# X-Privacy-Cleaner-Unsubscribe header. The List-Unsubscribe link itself is
+# always treated as sensitive and is never rewritten (its token is preserved).
+surface_unsubscribe = true
+
+# Per-sender policy overrides, evaluated in order (first match wins). Every
+# toggle is optional and inherits the global value when omitted. `no_modify`
+# forces report-only behaviour for that sender.
+#
+# [[sender_policies]]
+# match_domains = ["bank.example", "accounts.example"]
+# no_modify = true              # never rewrite the body for this sender
+#
+# [[sender_policies]]
+# match_domains = ["newsletter.example"]
+# unwrap_known_redirects = true
+# remove_pixels = true
 
 # --- Failure behaviour -------------------------------------------------------
 

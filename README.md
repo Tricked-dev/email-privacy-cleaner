@@ -5,15 +5,29 @@ privacy-invasive parts of email, designed to run as a pre-queue milter for the
 [Stalwart](https://stalw.art) mail server at the SMTP **DATA** stage (but usable
 standalone via the CLI).
 
-It performs three independent, deterministic, **offline** transformations:
+It performs these independent, deterministic, **offline** transformations:
 
 1. **Tracking-pixel removal** — drops 1×1 / hidden / known-beacon `<img>` tags.
 2. **Tracking query-parameter stripping** — `utm_*`, `fbclid`, `gclid`,
-   `mc_cid`, `_hsenc`, … (configurable, case-insensitive).
-3. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
+   `mc_cid`, `_hsenc`, … (configurable, case-insensitive; `prefix*` supported).
+3. **Vendor-specific URL cleaning** — host-scoped ClearURLs-style rules for
+   Amazon (`ref`, `pf_rd_*`, `tag`, …), YouTube (`si`), eBay (`_trkparms`),
+   Twitter/X, LinkedIn, Reddit, TikTok and more (see `src/vendor.rs`).
+4. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
    Constant Contact, HubSpot, Customer.io, Iterable, Klaviyo, Mailgun,
    Brevo/Sendinblue, Postmark, SparkPost — **only** when the destination is
    explicitly embedded in the link and passes validation.
+
+It is also **sender-aware**:
+
+* **Per-sender policies** — config rules keyed by the `From:` domain can switch
+  mode or toggle individual features per sender.
+* **Sensitive-sender protection** — for built-in identity/payment/auth senders,
+  link rewriting and redirect unwrapping are skipped so magic-login / 2FA /
+  password-reset links never break (pixel removal still applies).
+* **List-Unsubscribe handling** — the unsubscribe link is treated as sensitive
+  and left byte-for-byte intact (its recipient token survives); its target can
+  be surfaced in an `X-Privacy-Cleaner-Unsubscribe` header.
 
 An optional, **opt-in** network redirect resolver exists behind the `network`
 cargo feature; it is disabled by default and heavily SSRF-guarded.
@@ -26,8 +40,9 @@ cargo feature; it is disabled by default and heavily SSRF-guarded.
 
 ```
 email_privacy_cleaner          (library crate)
-├── config        CleanerConfig (TOML), tracking-param / pixel-domain tables
-├── url_clean     clean_url()              — query-param stripping
+├── config        CleanerConfig (TOML), tracking tables, sender policies
+├── vendor        host-scoped vendor URL rule table (Amazon, YouTube, …)
+├── url_clean     clean_url()              — query-param + vendor stripping
 ├── redirect      unwrap_redirect_url()    — offline ESP unwrapping
 ├── validate      destination validation + SSRF IP blocking
 ├── html          clean_html()             — lol_html-based rewriting
@@ -37,7 +52,7 @@ email_privacy_cleaner          (library crate)
 └── milter        Sendmail/Postfix milter-protocol server
 
 binaries:
-  email-privacy-cleaner   CLI
+  email-privacy-cleaner   CLI (clean / explain / diff / print-trackers)
   email-privacy-milter    milter daemon
 ```
 
@@ -80,6 +95,8 @@ X-Privacy-Cleaner-URLs-Cleaned: <n>
 X-Privacy-Cleaner-Redirects-Unwrapped: <n>
 X-Privacy-Cleaner-Pixels-Removed: <n>
 X-Privacy-Cleaner-Body-Modified: yes | no
+X-Privacy-Cleaner-Policy: default | sensitive-sender | custom:<domain>
+X-Privacy-Cleaner-Unsubscribe: <url>       # when surface_unsubscribe + present
 X-Privacy-Cleaner-Error: <short error>     # only on fail-open
 ```
 
@@ -105,8 +122,31 @@ email-privacy-cleaner clean-html --config config.toml < input.html > output.html
 # Explain how one URL is treated (provider, unwrap, params)
 email-privacy-cleaner explain-url "https://u1.ct.sendgrid.net/ls/click?url=https%3A%2F%2Fexample.com%2Fp%3Futm_source%3Dx"
 
+# Explain a whole message: sender policy, per-link treatment, unsubscribe target
+email-privacy-cleaner explain-message --config config.toml < raw.eml
+
+# List the trackers detected in a message (params, ESP wrappers, pixels)
+email-privacy-cleaner print-trackers < raw.eml
+
+# Show a line diff between the original and cleaned message
+email-privacy-cleaner diff-message < raw.eml
+
 # Run the cleaner over a directory of *.eml fixtures and report
 email-privacy-cleaner test-rules tests/fixtures/
+```
+
+`explain-message` example output:
+
+```
+sender:   news.example.com
+policy:   default
+effective: clean_query_params=true unwrap_redirects=true vendor_rules=true remove_pixels=true mode=enforce
+unsubscribe: https://news.example.com/u?uid=42&tok=SECRET, mailto:unsub@news.example.com
+html-parts: 1
+  [1] https://shop.example.com/sale?id=1&utm_source=news
+      -> CLEAN (stripped ["utm_source"]) -> https://shop.example.com/sale?id=1
+  [2] https://news.example.com/u?uid=42&tok=SECRET
+      -> SENSITIVE (List-Unsubscribe) — left untouched
 ```
 
 `explain-url` example output:
@@ -173,14 +213,18 @@ default. Highlights:
 | `clean_text_plain` | `false` | query-clean text/plain parts |
 | `remove_pixels` | `true` | drop tracking pixels |
 | `clean_query_params` | `true` | strip tracking params |
+| `apply_vendor_rules` | `true` | host-scoped vendor URL rules |
 | `unwrap_known_redirects` | `true` | offline ESP unwrapping |
+| `protect_sensitive_senders` | `true` | skip link rewriting for auth/payment senders |
+| `surface_unsubscribe` | `true` | add `X-Privacy-Cleaner-Unsubscribe` header |
+| `sender_policies` | `[]` | per-sender overrides (first match wins) |
 | `network_redirect_resolution` | `false` | opt-in network resolver |
 | `preserve_original_href` | `true` | keep original in `data-original-href` |
 | `fail_open` | `true` | pass-through vs tempfail on error |
 | `max_message_size` | 50 MiB | hard input limit |
 | `max_html_part_size` | 8 MiB | per-part HTML limit |
 | `blocked_domains` | `[]` | links neutralised to `about:blank` |
-| `extra_tracking_params` | `[]` | merged with built-ins |
+| `extra_tracking_params` | `[]` | merged with built-ins (`prefix*` allowed) |
 | `extra_pixel_domains` | `[]` | merged with built-ins |
 
 ## Security model

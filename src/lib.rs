@@ -32,9 +32,10 @@ pub mod network;
 pub mod redirect;
 pub mod url_clean;
 pub mod validate;
+pub mod vendor;
 
 // ---- Primary public surface (as specified) ----
-pub use config::{CleanerConfig, Mode};
+pub use config::{CleanerConfig, Mode, PolicyLabel, SenderPolicy};
 pub use error::{CleanerError, Result};
 pub use html::{clean_html, HtmlCleanResult};
 pub use mime::{clean_message, CleanStats, CleanerResult};

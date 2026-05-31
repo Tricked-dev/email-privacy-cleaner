@@ -370,3 +370,104 @@ fn oversized_message_is_rejected() {
     let raw = fixture("logo.eml");
     assert!(clean_message(&raw, &c).is_err());
 }
+
+#[test]
+fn vendor_specific_params_stripped_from_amazon_and_youtube() {
+    let raw = fixture("amazon.eml");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified);
+    let html = html_body_of(&r.cleaned);
+    // Amazon tracking params gone, functional ones kept.
+    assert!(!html.contains("pf_rd_r"), "amazon pf_rd_r must be stripped");
+    assert!(!html.contains("pd_rd_w"), "amazon pd_rd_w must be stripped");
+    assert!(!html.contains("tag=aff-20"), "amazon affiliate tag must be stripped");
+    assert!(html.contains("th=1"), "amazon variation selector must survive");
+    assert!(html.contains("keywords=usb"), "search keywords must survive");
+    // YouTube tracking gone, video id kept.
+    assert!(!html.contains("si=TRACKINGID"), "youtube si must be stripped");
+    assert!(html.contains("v=dQw4w9WgXcQ"), "youtube video id must survive");
+}
+
+#[test]
+fn vendor_rules_disabled_leaves_amazon_link_untouched() {
+    let mut c = cfg();
+    c.apply_vendor_rules = false;
+    c.finalize();
+    let raw = fixture("amazon.eml");
+    let r = clean_message(&raw, &c).unwrap();
+    let html = html_body_of(&r.cleaned);
+    // pf_rd_r is vendor-only and not a global param, so it survives.
+    assert!(html.contains("pf_rd_r=ABC123"));
+}
+
+#[test]
+fn unsubscribe_link_preserved_and_surfaced() {
+    let raw = fixture("unsubscribe.eml");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified);
+    let html = html_body_of(&r.cleaned);
+
+    // The List-Unsubscribe link keeps its token AND its utm param (sensitive).
+    assert!(html.contains("tok=SECRET-TOKEN"), "unsub token must survive");
+    assert!(
+        html.contains("https://news.example.com/u?uid=42&utm_source=footer&tok=SECRET-TOKEN"),
+        "the unsubscribe link must be left byte-for-byte intact"
+    );
+    // The ordinary tracked link IS cleaned.
+    assert!(!html.contains("utm_campaign=spring"));
+    assert!(html.contains("id=1"));
+    // Pixel removed.
+    assert_eq!(r.stats.pixels_removed, 1);
+
+    // The unsubscribe target is surfaced in an audit header.
+    let unsub = r
+        .audit_headers
+        .iter()
+        .find(|(n, _)| n == "X-Privacy-Cleaner-Unsubscribe");
+    assert!(unsub.is_some(), "unsubscribe header should be present");
+    assert!(unsub.unwrap().1.contains("news.example.com/u"));
+
+    // The original List-Unsubscribe headers are preserved verbatim.
+    let full = as_str(&r.cleaned);
+    assert!(full.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"));
+}
+
+#[test]
+fn sensitive_sender_skips_link_rewriting_but_removes_pixels() {
+    // Build a message from a built-in sensitive sender (paypal.com) with a
+    // tracked link and a tracking pixel.
+    let raw = concat!(
+        "From: PayPal <service@paypal.com>\r\n",
+        "To: User <user@example.org>\r\n",
+        "Subject: Receipt\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 7bit\r\n",
+        "\r\n",
+        "<html><body>",
+        "<a href=\"https://www.paypal.com/activate?token=MAGIC&utm_source=email\">Confirm</a>",
+        "<img src=\"https://track.example.net/o.gif\" width=\"1\" height=\"1\" alt=\"\">",
+        "</body></html>\r\n",
+    )
+    .as_bytes()
+    .to_vec();
+
+    let r = clean_message(&raw, &cfg()).unwrap();
+    let html = html_body_of(&r.cleaned);
+
+    // Query-param cleaning is disabled for sensitive senders: the magic token
+    // AND the utm param survive (we won't risk breaking the flow).
+    assert!(html.contains("token=MAGIC"));
+    assert!(html.contains("utm_source=email"));
+    assert_eq!(r.stats.urls_cleaned, 0);
+    // Pixel removal is always safe, so it still happens.
+    assert_eq!(r.stats.pixels_removed, 1);
+
+    let policy = r
+        .audit_headers
+        .iter()
+        .find(|(n, _)| n == "X-Privacy-Cleaner-Policy")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(policy, "sensitive-sender");
+}

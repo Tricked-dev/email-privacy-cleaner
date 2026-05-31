@@ -18,9 +18,12 @@ pub struct UrlCleanResult {
 
 /// Remove known tracking query parameters from `url`.
 ///
-/// Parameter *names* are matched case-insensitively. The raw encoding of the
-/// surviving parameters is preserved byte-for-byte so we don't accidentally
-/// re-encode values (which could break signed/magic links).
+/// Parameter *names* are matched case-insensitively. Removal combines the
+/// global tracking-param table with the host-specific
+/// [`vendor`](crate::vendor) rules (when `config.apply_vendor_rules` is set).
+/// The raw encoding of the surviving parameters is preserved byte-for-byte so
+/// we don't accidentally re-encode values (which could break signed/magic
+/// links).
 pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
     let query = match url.query() {
         Some(q) if !q.is_empty() => q,
@@ -32,6 +35,8 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
             }
         }
     };
+
+    let host = url.host_str().unwrap_or("");
 
     let mut kept: Vec<&str> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
@@ -45,7 +50,12 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
         let key_plus = key_raw.replace('+', " ");
         let key = percent_decode_str(&key_plus).decode_utf8_lossy();
 
-        if config.is_tracking_param(&key) {
+        let is_tracker = config.is_tracking_param(&key)
+            || (config.apply_vendor_rules
+                && !host.is_empty()
+                && crate::vendor::is_vendor_tracking_param(host, &key));
+
+        if is_tracker {
             removed.push(key.into_owned());
         } else {
             kept.push(segment);
@@ -122,6 +132,45 @@ mod tests {
     fn no_query_is_noop() {
         let u = Url::parse("https://e.com/path").unwrap();
         let r = clean_url(&u, &cfg());
+        assert!(!r.changed);
+    }
+
+    #[test]
+    fn vendor_rules_strip_amazon_tracking_only() {
+        let u = Url::parse(
+            "https://www.amazon.com/dp/B000?ref=foo&pf_rd_r=ABC&pd_rd_w=xyz&th=1&keywords=cable",
+        )
+        .unwrap();
+        let r = clean_url(&u, &cfg());
+        assert!(r.changed);
+        let s = r.url.as_str();
+        assert!(!s.contains("ref="));
+        assert!(!s.contains("pf_rd_r"));
+        assert!(!s.contains("pd_rd_w"));
+        // Functional params survive.
+        assert!(s.contains("th=1"));
+        assert!(s.contains("keywords=cable"));
+    }
+
+    #[test]
+    fn vendor_rules_are_host_scoped() {
+        // `pf_rd_r` is Amazon-only tracking; on another host it must survive
+        // (and it is not in the global tracking-param table).
+        let u = Url::parse("https://shop.example.com/p?pf_rd_r=affiliate&id=5").unwrap();
+        let r = clean_url(&u, &cfg());
+        assert!(!r.changed);
+        assert!(r.url.as_str().contains("pf_rd_r=affiliate"));
+    }
+
+    #[test]
+    fn vendor_rules_can_be_disabled() {
+        let mut c = CleanerConfig::default();
+        c.apply_vendor_rules = false;
+        c.finalize();
+        // pf_rd_r is vendor-only; with vendor rules off and no global match it
+        // must survive.
+        let u = Url::parse("https://www.amazon.com/dp/B000?pf_rd_r=foo&id=1").unwrap();
+        let r = clean_url(&u, &c);
         assert!(!r.changed);
     }
 }
