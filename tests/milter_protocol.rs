@@ -103,8 +103,8 @@ fn full_milter_conversation_modifies_and_adds_headers() {
     assert!(!body_str.contains("utm_source"), "param should be stripped");
     assert!(body_str.contains("id=1"));
 
-    // Audit headers added (7 of them), including the signature header.
-    assert_eq!(add_headers.len(), 7);
+    // Audit headers added (8 of them): the original seven plus the policy header.
+    assert_eq!(add_headers.len(), 8);
     let names: Vec<String> = add_headers
         .iter()
         .map(|d| {
@@ -114,6 +114,7 @@ fn full_milter_conversation_modifies_and_adds_headers() {
         .collect();
     assert!(names.contains(&"X-Privacy-Cleaner".to_string()));
     assert!(names.contains(&"X-Privacy-Cleaner-Pixels-Removed".to_string()));
+    assert!(names.contains(&"X-Privacy-Cleaner-Policy".to_string()));
 
     // Quit and join.
     write_packet(&mut c, b'Q', &[]);

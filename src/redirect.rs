@@ -20,23 +20,6 @@ use crate::validate::{validate_destination, RejectReason};
 /// destination value.
 pub const MAX_DECODE_DEPTH: usize = 3;
 
-/// Query parameter names that commonly hold the embedded destination URL.
-/// Matched case-insensitively. A candidate is only accepted if its value
-/// decodes to a valid `http(s)` URL, so generic-looking names (`u`, `r`) are
-/// safe to include — non-URL values are simply ignored.
-const DESTINATION_PARAMS: &[&str] = &[
-    "url",
-    "redirect",
-    "redirect_url",
-    "target",
-    "destination",
-    "dest",
-    "ru",
-    "link",
-    "u",
-    "r",
-];
-
 /// Outcome of [`unwrap_redirect_url`](crate::unwrap_redirect_url).
 #[derive(Debug, Clone)]
 pub struct RedirectUnwrapResult {
@@ -47,111 +30,67 @@ pub struct RedirectUnwrapResult {
     pub original: Url,
     /// `true` when a destination was successfully extracted and validated.
     pub unwrapped: bool,
-    /// The recognised ESP provider, if any.
-    pub provider: Option<&'static str>,
+    /// The recognised provider, if any (from the rule pack).
+    pub provider: Option<String>,
     /// If a candidate destination was found but rejected, why.
     pub rejected: Option<RejectReason>,
 }
 
-/// Detect which ESP a tracking URL belongs to, if any.
-///
-/// Returns a static provider label used both to gate unwrapping (we only unwrap
-/// known providers) and for audit/debug output.
-pub fn detect_provider(url: &Url) -> Option<&'static str> {
-    let host = url.host_str()?.to_ascii_lowercase();
-    let path = url.path().to_ascii_lowercase();
-
-    let host_ends = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
-
-    // SendGrid: branded click domains, the *.sendgrid.net hosts, or the
-    // distinctive /ls/click path.
-    if host_ends("sendgrid.net") || host.contains("sendgrid") || path.starts_with("/ls/click") {
-        return Some("sendgrid");
-    }
-    // Mailchimp list-manage click tracking.
-    if host_ends("list-manage.com") && path.contains("/track/click") {
-        return Some("mailchimp");
-    }
-    // Mandrill / Mailchimp transactional.
-    if host_ends("mandrillapp.com") && path.contains("/track/click") {
-        return Some("mandrill");
-    }
-    // Constant Contact.
-    if host_ends("rs6.net") && path.starts_with("/tn.jsp") {
-        return Some("constantcontact");
-    }
-    // HubSpot.
-    if host_ends("hs-sites.com") || host_ends("hubspotemail.net") || host_ends("hubspotlinks.com") {
-        return Some("hubspot");
-    }
-    // Customer.io.
-    if host_ends("customer.io") && host.starts_with("track.") {
-        return Some("customerio");
-    }
-    // Iterable.
-    if host_ends("iterable.com") && host.starts_with("links.") {
-        return Some("iterable");
-    }
-    // Klaviyo.
-    if host_ends("klaviyo.com") && host.starts_with("click.") {
-        return Some("klaviyo");
-    }
-    // Mailgun click tracking.
-    if host.contains("mailgun") && host.starts_with("email.") {
-        return Some("mailgun");
-    }
-    // Brevo / Sendinblue.
-    if host_ends("sibautomation.com") || host.contains("sendibm") {
-        return Some("brevo");
-    }
-    // Postmark.
-    if host_ends("pstmrk.it") {
-        return Some("postmark");
-    }
-    // SparkPost.
-    if host_ends("spgo.io") || host.starts_with("links.") {
-        return Some("sparkpost");
-    }
-
-    None
-}
-
-/// Attempt to unwrap a tracking/redirect URL offline.
+/// Attempt to unwrap a tracking/redirect URL offline using the rule pack's
+/// `redirections` (the destination is extracted from the URL itself — no
+/// network access). The extracted destination is always validated before use.
 pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapResult {
-    let provider = detect_provider(url);
+    // An excluded host is left entirely untouched (no unwrap, no param strip).
+    if let Some(host) = url.host_str() {
+        if config.is_excluded_domain(host) {
+            return RedirectUnwrapResult {
+                url: url.clone(),
+                original: url.clone(),
+                unwrapped: false,
+                provider: None,
+                rejected: None,
+            };
+        }
+    }
 
-    // Only attempt extraction for recognised providers; otherwise we'd risk
-    // "unwrapping" legitimate `?url=` style links on ordinary sites.
-    if let Some(provider) = provider {
-        match extract_destination(url) {
-            Ok(Some(dest)) => {
-                // Clean tracking params off the *destination* too.
-                let cleaned = clean_url(&dest, config).url;
-                return RedirectUnwrapResult {
-                    url: cleaned,
-                    original: url.clone(),
-                    unwrapped: true,
-                    provider: Some(provider),
-                    rejected: None,
-                };
-            }
-            Ok(None) => {}
-            Err(reason) => {
-                // A candidate was present but failed validation: keep original
-                // (query-cleaned) and record why.
-                let cleaned = clean_url(url, config).url;
-                return RedirectUnwrapResult {
-                    url: cleaned,
-                    original: url.clone(),
-                    unwrapped: false,
-                    provider: Some(provider),
-                    rejected: Some(reason),
-                };
+    let ruleset = config.ruleset();
+    let url_str = url.as_str();
+    let provider = ruleset.detect_provider(url_str).map(|s| s.to_string());
+
+    if config.unwrap_known_redirects {
+        if let Some(raw) = ruleset.redirect_target(url_str) {
+            if let Some(candidate) = decode_candidate(&raw) {
+                match validate_destination(&candidate) {
+                    Ok(()) => {
+                        // Clean tracking params off the *destination* too.
+                        let cleaned = clean_url(&candidate, config).url;
+                        return RedirectUnwrapResult {
+                            url: cleaned,
+                            original: url.clone(),
+                            unwrapped: true,
+                            provider,
+                            rejected: None,
+                        };
+                    }
+                    Err(reason) => {
+                        // A candidate was present but failed validation: keep the
+                        // original (query-cleaned) and record why.
+                        let cleaned = clean_url(url, config).url;
+                        return RedirectUnwrapResult {
+                            url: cleaned,
+                            original: url.clone(),
+                            unwrapped: false,
+                            provider,
+                            rejected: Some(reason),
+                        };
+                    }
+                }
             }
         }
     }
 
-    // Low confidence: keep original but strip tracking params.
+    // No embedded destination (or unwrapping disabled): keep original but strip
+    // tracking params.
     let cleaned = clean_url(url, config).url;
     RedirectUnwrapResult {
         url: cleaned,
@@ -159,38 +98,6 @@ pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapR
         unwrapped: false,
         provider,
         rejected: None,
-    }
-}
-
-/// Look through the candidate destination parameters and return the first one
-/// that decodes to a valid destination.
-///
-/// * `Ok(Some(url))` — a valid destination was found.
-/// * `Ok(None)` — no candidate parameter held a URL-like value.
-/// * `Err(reason)` — a URL-like candidate was found but rejected by validation.
-fn extract_destination(url: &Url) -> Result<Option<Url>, RejectReason> {
-    let mut last_reject: Option<RejectReason> = None;
-
-    for (key, value) in url.query_pairs() {
-        let key_lc = key.to_ascii_lowercase();
-        if !DESTINATION_PARAMS.iter().any(|p| *p == key_lc) {
-            continue;
-        }
-        if value.is_empty() {
-            continue;
-        }
-        match decode_candidate(&value) {
-            Some(candidate) => match validate_destination(&candidate) {
-                Ok(()) => return Ok(Some(candidate)),
-                Err(reason) => last_reject = Some(reason),
-            },
-            None => continue,
-        }
-    }
-
-    match last_reject {
-        Some(r) => Err(r),
-        None => Ok(None),
     }
 }
 
@@ -240,7 +147,7 @@ mod tests {
         .unwrap();
         let r = unwrap_redirect_url(&u, &cfg());
         assert!(r.unwrapped);
-        assert_eq!(r.provider, Some("sendgrid"));
+        assert_eq!(r.provider.as_deref(), Some("sendgrid"));
         // utm_source must also be stripped from the destination.
         assert_eq!(r.url.as_str(), "https://example.com/article");
     }
@@ -265,7 +172,7 @@ mod tests {
         .unwrap();
         let r = unwrap_redirect_url(&u, &cfg());
         assert!(!r.unwrapped);
-        assert_eq!(r.provider, Some("mailchimp"));
+        assert_eq!(r.provider.as_deref(), Some("mailchimp"));
         assert!(!r.url.as_str().contains("mc_cid"));
         assert!(!r.url.as_str().contains("mc_eid"));
         // The non-tracking params survive.
@@ -280,7 +187,7 @@ mod tests {
         assert!(!r.unwrapped);
         assert!(matches!(r.rejected, Some(RejectReason::BadScheme(_))));
         // We keep the original (it has no tracking params to strip here).
-        assert_eq!(r.provider, Some("sendgrid"));
+        assert_eq!(r.provider.as_deref(), Some("sendgrid"));
     }
 
     #[test]

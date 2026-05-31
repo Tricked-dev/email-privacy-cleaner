@@ -24,6 +24,11 @@ struct Cli {
     /// Override the listen address from the config (e.g. 127.0.0.1:11333).
     #[arg(long)]
     listen: Option<String>,
+
+    /// Additional ClearURLs-format rule pack to load (repeatable). Merged on top
+    /// of the config's `rule_packs`, so it works alongside `--config` too.
+    #[arg(long = "rule-pack", value_name = "PATH")]
+    rule_pack: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -43,6 +48,15 @@ fn main() -> ExitCode {
     if let Some(listen) = cli.listen {
         cfg.listen = listen;
     }
+
+    // CLI-supplied packs augment whatever the config already lists. `run`
+    // finalizes the config (compiling the combined ruleset), so this works
+    // whether the config came from --config, defaults, or nothing.
+    cfg.rule_packs.extend(
+        cli.rule_pack
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
 
     match milter::run(cfg) {
         Ok(()) => ExitCode::SUCCESS,

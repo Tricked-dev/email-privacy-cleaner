@@ -5,29 +5,47 @@ privacy-invasive parts of email, designed to run as a pre-queue milter for the
 [Stalwart](https://stalw.art) mail server at the SMTP **DATA** stage (but usable
 standalone via the CLI).
 
-It performs three independent, deterministic, **offline** transformations:
+It performs these independent, deterministic, **offline** transformations:
 
 1. **Tracking-pixel removal** — drops 1×1 / hidden / known-beacon `<img>` tags.
 2. **Tracking query-parameter stripping** — `utm_*`, `fbclid`, `gclid`,
-   `mc_cid`, `_hsenc`, … (configurable, case-insensitive).
-3. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
+   `mc_cid`, `_hsenc`, … (configurable, case-insensitive; `prefix*` supported).
+3. **Vendor-specific URL cleaning** — host-scoped rules for Amazon (`pf_rd_*`,
+   `tag`, …), YouTube (`si`), eBay (`_trkparms`), Twitter/X, LinkedIn, Reddit,
+   TikTok and more, shipped in the built-in rule pack.
+4. **First-stage ESP redirect unwrapping** — SendGrid, Mailchimp, Mandrill,
    Constant Contact, HubSpot, Customer.io, Iterable, Klaviyo, Mailgun,
    Brevo/Sendinblue, Postmark, SparkPost — **only** when the destination is
    explicitly embedded in the link and passes validation.
 
-An optional, **opt-in** network redirect resolver exists behind the `network`
-cargo feature; it is disabled by default and heavily SSRF-guarded.
+It is also **sender-aware**:
 
-> No network access. No JavaScript execution. No image fetching. Attachments
-> are never altered. The cleaning path is deterministic and bounded — suitable
-> for the synchronous SMTP DATA stage.
+* **Per-sender policies** — config rules keyed by the `From:` domain can switch
+  mode or toggle individual features per sender.
+* **Sensitive-sender protection** — for built-in identity/payment/auth senders,
+  link rewriting and redirect unwrapping are skipped so magic-login / 2FA /
+  password-reset links never break (pixel removal still applies).
+* **List-Unsubscribe handling** — the unsubscribe link is treated as sensitive
+  and left byte-for-byte intact (its recipient token survives); its target can
+  be surfaced in an `X-Privacy-Cleaner-Unsubscribe` header.
+
+A network redirect resolver and HTTP(S) rule-pack fetching are compiled in by
+default (the `network` cargo feature), but both stay **inert unless you opt in**
+at runtime, and the resolver is heavily SSRF-guarded. See
+[the note on the network feature](#note-on-the-network-feature) to build them
+out entirely.
+
+> No network access during cleaning. No JavaScript execution. No image
+> fetching. Attachments are never altered. The per-message cleaning path is
+> deterministic and bounded — suitable for the synchronous SMTP DATA stage.
 
 ## Crate layout
 
 ```
 email_privacy_cleaner          (library crate)
-├── config        CleanerConfig (TOML), tracking-param / pixel-domain tables
-├── url_clean     clean_url()              — query-param stripping
+├── config        CleanerConfig (TOML), sender policies, rule-pack loading
+├── ruleset       ClearURLs-format rule engine (built-in + external packs)
+├── url_clean     clean_url()              — query-param + vendor stripping
 ├── redirect      unwrap_redirect_url()    — offline ESP unwrapping
 ├── validate      destination validation + SSRF IP blocking
 ├── html          clean_html()             — lol_html-based rewriting
@@ -37,7 +55,7 @@ email_privacy_cleaner          (library crate)
 └── milter        Sendmail/Postfix milter-protocol server
 
 binaries:
-  email-privacy-cleaner   CLI
+  email-privacy-cleaner   CLI (clean / explain / diff / print-trackers)
   email-privacy-milter    milter daemon
 ```
 
@@ -80,6 +98,8 @@ X-Privacy-Cleaner-URLs-Cleaned: <n>
 X-Privacy-Cleaner-Redirects-Unwrapped: <n>
 X-Privacy-Cleaner-Pixels-Removed: <n>
 X-Privacy-Cleaner-Body-Modified: yes | no
+X-Privacy-Cleaner-Policy: default | sensitive-sender | custom:<domain>
+X-Privacy-Cleaner-Unsubscribe: <url>       # when surface_unsubscribe + present
 X-Privacy-Cleaner-Error: <short error>     # only on fail-open
 ```
 
@@ -88,9 +108,10 @@ X-Privacy-Cleaner-Error: <short error>     # only on fail-open
 ```bash
 cargo build --release
 # binaries in target/release/{email-privacy-cleaner,email-privacy-milter}
+# the `network` feature is on by default (see the note at the bottom)
 
-# with the optional network resolver compiled in:
-cargo build --release --features network
+# fully offline build (no networking code compiled in):
+cargo build --release --no-default-features
 ```
 
 ## CLI usage
@@ -105,8 +126,31 @@ email-privacy-cleaner clean-html --config config.toml < input.html > output.html
 # Explain how one URL is treated (provider, unwrap, params)
 email-privacy-cleaner explain-url "https://u1.ct.sendgrid.net/ls/click?url=https%3A%2F%2Fexample.com%2Fp%3Futm_source%3Dx"
 
+# Explain a whole message: sender policy, per-link treatment, unsubscribe target
+email-privacy-cleaner explain-message --config config.toml < raw.eml
+
+# List the trackers detected in a message (params, ESP wrappers, pixels)
+email-privacy-cleaner print-trackers < raw.eml
+
+# Show a line diff between the original and cleaned message
+email-privacy-cleaner diff-message < raw.eml
+
 # Run the cleaner over a directory of *.eml fixtures and report
 email-privacy-cleaner test-rules tests/fixtures/
+```
+
+`explain-message` example output:
+
+```
+sender:   news.example.com
+policy:   default
+effective: clean_query_params=true unwrap_redirects=true vendor_rules=true remove_pixels=true mode=enforce
+unsubscribe: https://news.example.com/u?uid=42&tok=SECRET, mailto:unsub@news.example.com
+html-parts: 1
+  [1] https://shop.example.com/sale?id=1&utm_source=news
+      -> CLEAN (stripped ["utm_source"]) -> https://shop.example.com/sale?id=1
+  [2] https://news.example.com/u?uid=42&tok=SECRET
+      -> SENSITIVE (List-Unsubscribe) — left untouched
 ```
 
 `explain-url` example output:
@@ -173,15 +217,50 @@ default. Highlights:
 | `clean_text_plain` | `false` | query-clean text/plain parts |
 | `remove_pixels` | `true` | drop tracking pixels |
 | `clean_query_params` | `true` | strip tracking params |
+| `apply_vendor_rules` | `true` | host-scoped (non-global) rule-pack rules |
+| `strip_referral_marketing` | `false` | also strip `referralMarketing` params |
 | `unwrap_known_redirects` | `true` | offline ESP unwrapping |
+| `protect_sensitive_senders` | `true` | skip link rewriting for auth/payment senders |
+| `surface_unsubscribe` | `true` | add `X-Privacy-Cleaner-Unsubscribe` header |
+| `sender_policies` | `[]` | per-sender overrides (first match wins) |
 | `network_redirect_resolution` | `false` | opt-in network resolver |
 | `preserve_original_href` | `true` | keep original in `data-original-href` |
 | `fail_open` | `true` | pass-through vs tempfail on error |
 | `max_message_size` | 50 MiB | hard input limit |
 | `max_html_part_size` | 8 MiB | per-part HTML limit |
 | `blocked_domains` | `[]` | links neutralised to `about:blank` |
-| `extra_tracking_params` | `[]` | merged with built-ins |
+| `extra_tracking_params` | `[]` | merged with built-ins (`prefix*` allowed) |
 | `extra_pixel_domains` | `[]` | merged with built-ins |
+| `keep_params` | `[]` | params never stripped, even if a rule matches (`prefix*`) |
+| `exclude_domains` | `[]` | hosts left entirely untouched (suffix match) |
+| `disabled_providers` | `[]` | rule-pack provider names to switch off |
+| `rule_packs` | `[]` | external ClearURLs-format pack files to merge |
+| `rule_pack_urls` | `[]` | pack URLs (`file://`/paths load offline; `http(s)` needs `network`) |
+
+## Rule packs (ClearURLs format)
+
+The default tracking params, vendor rules, ESP redirect unwrappers and known
+beacon hosts ship as a **ClearURLs-format JSON document** compiled into the
+binary ([`rules/builtin.json`](rules/builtin.json)) — original work under this
+crate's MIT/Apache licence. The same parser loads **external packs** (file paths
+via `rule_packs`, or URLs via `rule_pack_urls` with the `network` feature) and
+**merges** them on top of the built-ins, so coverage can be extended without
+code changes — including with the upstream [ClearURLs](https://clearurls.xyz)
+`data.min.json`.
+
+Supported per provider: `urlPattern`, `rules` (param-name regexes),
+`referralMarketing`, `rawRules`, `exceptions`, `redirections` (capture group 1
+is the embedded destination, always re-validated by `validate` before any link
+is rewritten), and `completeProvider` (treated as a beacon-host signal for
+tracking-pixel detection only — **never** used to neutralise an `<a>` link, so
+click-throughs are never broken). Regexes compile with the linear-time `regex`
+crate (no catastrophic backtracking); patterns using unsupported features (e.g.
+lookaround in a third-party pack) are skipped individually while the rest of the
+pack still loads.
+
+> The upstream ClearURLs rules are copyleft (LGPL); this crate ships only the
+> parser, not that data. Download it and point `rule_packs`/`rule_pack_urls` at
+> it if you want it.
 
 ## Security model
 
@@ -273,7 +352,21 @@ Add the flake and import the module:
               remove_pixels = true;
               clean_query_params = true;
               extra_tracking_params = [ "my_custom_tracker" ];
+              # Exclusions (carve-outs that override the rule pack):
+              keep_params = [ "ref" ];
+              exclude_domains = [ "intranet.example" ];
+              disabled_providers = [ "amazon" ];
             };
+            # Declaratively prefetch external ClearURLs-format packs into the
+            # store (pinned by hash) and load them offline at runtime. Works
+            # alongside `settings` AND `configFile`.
+            rulePacks = [
+              ./my-extra-rules.json
+              {
+                url = "https://rules2.clearurls.xyz/data.min.json";
+                sha256 = "sha256-AAAA...";   # nix will tell you the real hash
+              }
+            ];
           };
         }
       ];
@@ -285,9 +378,29 @@ Add the flake and import the module:
 The module renders `settings` to a TOML config (or accepts a `configFile`) and
 runs the daemon as a hardened, stateless systemd service (`DynamicUser`,
 `ProtectSystem=strict`, locked-down syscall/address-family filters, no
-capabilities, loopback-only egress when listening on localhost). Point Stalwart
-at the configured `listen` address as shown in
+capabilities, loopback-only egress when listening on localhost). `rulePacks` are
+prefetched at build time and passed as `--rule-pack` arguments, so they compose
+with either `settings` or `configFile` and need no runtime network. Point
+Stalwart at the configured `listen` address as shown in
 [Stalwart integration](#stalwart-integration).
+
+## Note on the `network` feature
+
+The `network` cargo feature is **enabled by default**, so a stock
+`cargo build` / `nix build` compiles it in. It only adds *capability*, not
+behaviour: everything it enables stays inert until you opt in, and the
+per-message cleaning path is still fully offline.
+
+Building with `--no-default-features` drops the networking code entirely. The
+only things unavailable in that build are:
+
+* the optional network **redirect resolver** (`network_redirect_resolution`); and
+* fetching `http(s)://` entries in `rule_pack_urls`.
+
+Everything else is unchanged — including `file://` and local-path rule packs,
+which still load offline. (The resolver is also off at runtime by default even
+when compiled in, so a default build behaves identically until you flip
+`network_redirect_resolution = true` or add an `http(s)://` rule-pack URL.)
 
 ## License
 

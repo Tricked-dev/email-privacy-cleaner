@@ -23,8 +23,10 @@ name = "email-privacy-milter"
 path = "src/bin/email-privacy-milter.rs"
 
 [features]
-default = []
-# Optional, opt-in network redirect resolver (phase 2). Disabled by default.
+# `network` is on by default: it compiles in the (still runtime-opt-in) redirect
+# resolver and HTTP(S) rule-pack fetching. Build with `--no-default-features`
+# for a binary with no networking code at all (see the README note).
+default = ["network"]
 network = ["dep:ureq"]
 
 [dependencies]
@@ -35,7 +37,9 @@ percent-encoding = "2"
 base64 = "0.22"
 quoted_printable = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+regex = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 

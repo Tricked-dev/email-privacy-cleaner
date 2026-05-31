@@ -6,6 +6,7 @@
 //! whether to drop an element.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use lol_html::html_content::ContentType;
 use lol_html::{element, rewrite_str, RewriteStrSettings};
@@ -13,6 +14,28 @@ use url::Url;
 
 use crate::config::CleanerConfig;
 use crate::redirect::unwrap_redirect_url;
+
+/// Per-message context for HTML cleaning that isn't part of the static config.
+///
+/// Currently carries the set of "sensitive" links (e.g. `List-Unsubscribe`
+/// targets) whose `href` must be left untouched so recipient-specific tokens
+/// survive.
+#[derive(Debug, Clone, Default)]
+pub struct LinkContext<'a> {
+    /// Normalised URLs (serialized `Url` form) that must not be rewritten.
+    pub sensitive_urls: Option<&'a HashSet<String>>,
+}
+
+impl LinkContext<'_> {
+    fn is_sensitive(&self, raw_href: &str, parsed: &Url) -> bool {
+        match self.sensitive_urls {
+            Some(set) if !set.is_empty() => {
+                set.contains(parsed.as_str()) || set.contains(raw_href.trim())
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Outcome of [`clean_html`](crate::clean_html).
 #[derive(Debug, Clone, Default)]
@@ -45,6 +68,17 @@ pub fn clean_html(
     base_url: Option<&Url>,
     config: &CleanerConfig,
 ) -> crate::error::Result<HtmlCleanResult> {
+    clean_html_ctx(html, base_url, config, &LinkContext::default())
+}
+
+/// Like [`clean_html`], but with a [`LinkContext`] carrying per-message state
+/// (e.g. sensitive links that must not be rewritten).
+pub fn clean_html_ctx(
+    html: &str,
+    base_url: Option<&Url>,
+    config: &CleanerConfig,
+    ctx: &LinkContext<'_>,
+) -> crate::error::Result<HtmlCleanResult> {
     if html.len() > config.max_html_part_size {
         // Too large to process safely; leave untouched.
         return Ok(HtmlCleanResult {
@@ -65,7 +99,7 @@ pub fn clean_html(
     {
         handlers.push(element!("a[href], area[href]", |el| {
             if let Some(href) = el.get_attribute("href") {
-                if let Some((new_href, kind)) = process_href(&href, base_url, config) {
+                if let Some((new_href, kind)) = process_href(&href, base_url, config, ctx) {
                     if config.preserve_original_href {
                         let _ = el.set_attribute("data-original-href", &href);
                     }
@@ -120,6 +154,26 @@ pub fn clean_html(
     })
 }
 
+/// Extract every `<a>`/`<area>` `href` from an HTML fragment, in document
+/// order (duplicates included). Used by the CLI `explain-message` /
+/// `print-trackers` commands; performs no rewriting or network access.
+pub fn extract_links(html: &str) -> Vec<String> {
+    let links: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let _ = rewrite_str(
+        html,
+        RewriteStrSettings {
+            element_content_handlers: vec![element!("a[href], area[href]", |el| {
+                if let Some(h) = el.get_attribute("href") {
+                    links.borrow_mut().push(h);
+                }
+                Ok(())
+            })],
+            ..RewriteStrSettings::new()
+        },
+    );
+    links.into_inner()
+}
+
 enum HrefChange {
     Unwrapped,
     Cleaned,
@@ -131,6 +185,7 @@ fn process_href(
     href: &str,
     base_url: Option<&Url>,
     config: &CleanerConfig,
+    ctx: &LinkContext<'_>,
 ) -> Option<(String, HrefChange)> {
     let trimmed = href.trim();
     // Skip anchors, mailto:, tel:, cid:, data:, etc.
@@ -148,6 +203,12 @@ fn process_href(
     };
 
     if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+
+    // Sensitive links (e.g. List-Unsubscribe targets) carry recipient tokens —
+    // never rewrite them.
+    if ctx.is_sensitive(href, &url) {
         return None;
     }
 
@@ -190,9 +251,10 @@ fn is_tracking_pixel(el: &lol_html::html_content::Element, config: &CleanerConfi
     };
     let is_remote = remote_host.is_some();
 
-    // Known beacon/tracking host → always drop.
+    // Known beacon/tracking host (rule-pack completeProvider or extra_pixel_domains)
+    // → always drop.
     if let Some(host) = &remote_host {
-        if config.is_pixel_domain(host) {
+        if config.is_beacon(src, host) {
             return true;
         }
     }
@@ -336,6 +398,24 @@ mod tests {
         assert_eq!(r.redirects_unwrapped, 0);
         assert!(r.html.contains("token=SECRET-abc123"));
         assert!(r.html.contains("expires=999"));
+        assert!(!r.html.contains("data-original-href"));
+    }
+
+    #[test]
+    fn sensitive_link_is_left_untouched() {
+        let unsub = "https://news.example.com/unsub?uid=42&utm_source=footer&tok=SECRET";
+        let mut set = std::collections::HashSet::new();
+        // The context stores the normalised (parsed) form.
+        set.insert(Url::parse(unsub).unwrap().to_string());
+        let html = format!(r#"<a href="{unsub}">Unsubscribe</a>"#);
+        let ctx = LinkContext {
+            sensitive_urls: Some(&set),
+        };
+        let r = clean_html_ctx(&html, None, &cfg(), &ctx).unwrap();
+        assert_eq!(r.urls_cleaned, 0);
+        // utm_source would normally be stripped, but the token-bearing link survives.
+        assert!(r.html.contains("utm_source=footer"));
+        assert!(r.html.contains("tok=SECRET"));
         assert!(!r.html.contains("data-original-href"));
     }
 

@@ -370,3 +370,238 @@ fn oversized_message_is_rejected() {
     let raw = fixture("logo.eml");
     assert!(clean_message(&raw, &c).is_err());
 }
+
+#[test]
+fn vendor_specific_params_stripped_from_amazon_and_youtube() {
+    let raw = fixture("amazon.eml");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified);
+    let html = html_body_of(&r.cleaned);
+    // Amazon tracking params gone, functional ones kept.
+    assert!(!html.contains("pf_rd_r"), "amazon pf_rd_r must be stripped");
+    assert!(!html.contains("pd_rd_w"), "amazon pd_rd_w must be stripped");
+    assert!(
+        !html.contains("tag=aff-20"),
+        "amazon affiliate tag must be stripped"
+    );
+    assert!(
+        html.contains("th=1"),
+        "amazon variation selector must survive"
+    );
+    assert!(
+        html.contains("keywords=usb"),
+        "search keywords must survive"
+    );
+    // YouTube tracking gone, video id kept.
+    assert!(
+        !html.contains("si=TRACKINGID"),
+        "youtube si must be stripped"
+    );
+    assert!(
+        html.contains("v=dQw4w9WgXcQ"),
+        "youtube video id must survive"
+    );
+}
+
+#[test]
+fn vendor_rules_disabled_leaves_amazon_link_untouched() {
+    let mut c = cfg();
+    c.apply_vendor_rules = false;
+    c.finalize();
+    let raw = fixture("amazon.eml");
+    let r = clean_message(&raw, &c).unwrap();
+    let html = html_body_of(&r.cleaned);
+    // pf_rd_r is vendor-only and not a global param, so it survives.
+    assert!(html.contains("pf_rd_r=ABC123"));
+}
+
+#[test]
+fn unsubscribe_link_preserved_and_surfaced() {
+    let raw = fixture("unsubscribe.eml");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified);
+    let html = html_body_of(&r.cleaned);
+
+    // The List-Unsubscribe link keeps its token AND its utm param (sensitive).
+    assert!(
+        html.contains("tok=SECRET-TOKEN"),
+        "unsub token must survive"
+    );
+    assert!(
+        html.contains("https://news.example.com/u?uid=42&utm_source=footer&tok=SECRET-TOKEN"),
+        "the unsubscribe link must be left byte-for-byte intact"
+    );
+    // The ordinary tracked link IS cleaned.
+    assert!(!html.contains("utm_campaign=spring"));
+    assert!(html.contains("id=1"));
+    // Pixel removed.
+    assert_eq!(r.stats.pixels_removed, 1);
+
+    // The unsubscribe target is surfaced in an audit header.
+    let unsub = r
+        .audit_headers
+        .iter()
+        .find(|(n, _)| n == "X-Privacy-Cleaner-Unsubscribe");
+    assert!(unsub.is_some(), "unsubscribe header should be present");
+    assert!(unsub.unwrap().1.contains("news.example.com/u"));
+
+    // The original List-Unsubscribe headers are preserved verbatim.
+    let full = as_str(&r.cleaned);
+    assert!(full.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"));
+}
+
+#[test]
+fn sensitive_sender_skips_link_rewriting_but_removes_pixels() {
+    // Build a message from a built-in sensitive sender (paypal.com) with a
+    // tracked link and a tracking pixel.
+    let raw = concat!(
+        "From: PayPal <service@paypal.com>\r\n",
+        "To: User <user@example.org>\r\n",
+        "Subject: Receipt\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: text/html; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 7bit\r\n",
+        "\r\n",
+        "<html><body>",
+        "<a href=\"https://www.paypal.com/activate?token=MAGIC&utm_source=email\">Confirm</a>",
+        "<img src=\"https://track.example.net/o.gif\" width=\"1\" height=\"1\" alt=\"\">",
+        "</body></html>\r\n",
+    )
+    .as_bytes()
+    .to_vec();
+
+    let r = clean_message(&raw, &cfg()).unwrap();
+    let html = html_body_of(&r.cleaned);
+
+    // Query-param cleaning is disabled for sensitive senders: the magic token
+    // AND the utm param survive (we won't risk breaking the flow).
+    assert!(html.contains("token=MAGIC"));
+    assert!(html.contains("utm_source=email"));
+    assert_eq!(r.stats.urls_cleaned, 0);
+    // Pixel removal is always safe, so it still happens.
+    assert_eq!(r.stats.pixels_removed, 1);
+
+    let policy = r
+        .audit_headers
+        .iter()
+        .find(|(n, _)| n == "X-Privacy-Cleaner-Policy")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert_eq!(policy, "sensitive-sender");
+}
+
+#[test]
+fn external_rule_pack_file_is_loaded_and_applied() {
+    // Write a tiny ClearURLs-format pack to a temp file and point the config at it.
+    let path = std::env::temp_dir().join(format!(
+        "epc_pack_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        r#"{"providers":{"acme":{"urlPattern":"^https?://acme\\.test","rules":["sid","trk_.*"]}}}"#,
+    )
+    .unwrap();
+
+    let toml = format!(
+        "preserve_original_href = false\nrule_packs = [{:?}]\n",
+        path.to_string_lossy()
+    );
+    let cfg = CleanerConfig::from_toml_str(&toml).unwrap();
+
+    let html = r#"<html><body><a href="https://acme.test/p?sid=1&trk_x=2&keep=3&utm_source=z">x</a></body></html>"#;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: pack\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
+    raw.extend_from_slice(html.as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    let r = clean_message(&raw, &cfg).unwrap();
+    let out = html_body_of(&r.cleaned);
+    // Pack rules (sid, trk_*) AND the built-in global (utm_source) are stripped.
+    assert!(!out.contains("sid=1"), "got: {out}");
+    assert!(!out.contains("trk_x=2"));
+    assert!(!out.contains("utm_source"));
+    // Functional param survives.
+    assert!(out.contains("keep=3"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn rule_pack_url_accepts_file_scheme_offline() {
+    // Nix prefetch scenario: a remote pack is fetched into a local path and
+    // referenced via a file:// URL — must load with NO `network` feature.
+    let path = std::env::temp_dir().join(format!(
+        "epc_filepack_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        r#"{"providers":{"acme":{"urlPattern":"^https?://acme\\.test","rules":["sid"]}}}"#,
+    )
+    .unwrap();
+
+    let toml = format!(
+        "preserve_original_href = false\nrule_pack_urls = [\"file://{}\"]\n",
+        path.to_string_lossy()
+    );
+    let cfg = CleanerConfig::from_toml_str(&toml).unwrap();
+
+    let html = r#"<html><body><a href="https://acme.test/p?sid=1&keep=2">x</a></body></html>"#;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: filepack\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
+    raw.extend_from_slice(html.as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    let r = clean_message(&raw, &cfg).unwrap();
+    let out = html_body_of(&r.cleaned);
+    assert!(!out.contains("sid=1"), "got: {out}");
+    assert!(out.contains("keep=2"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn keep_params_exclusion_protects_a_param_and_domain() {
+    let cfg = CleanerConfig::from_toml_str(
+        "preserve_original_href = false\nkeep_params = [\"utm_source\"]\nexclude_domains = [\"trusted.example\"]\n",
+    )
+    .unwrap();
+
+    let html = concat!(
+        "<html><body>",
+        // utm_source kept (on the keep-list), utm_medium still stripped.
+        "<a href=\"https://shop.example/a?utm_source=news&utm_medium=email&id=1\">a</a>",
+        // whole host excluded -> untouched.
+        "<a href=\"https://trusted.example/b?utm_source=x&fbclid=y\">b</a>",
+        "</body></html>"
+    );
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: keep\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
+    raw.extend_from_slice(html.as_bytes());
+    raw.extend_from_slice(b"\r\n");
+
+    let r = clean_message(&raw, &cfg).unwrap();
+    let out = html_body_of(&r.cleaned);
+    assert!(
+        out.contains("utm_source=news"),
+        "kept param survives: {out}"
+    );
+    assert!(
+        !out.contains("utm_medium=email"),
+        "other tracker still stripped"
+    );
+    // Excluded domain: everything survives.
+    assert!(out.contains("https://trusted.example/b?utm_source=x&fbclid=y"));
+}

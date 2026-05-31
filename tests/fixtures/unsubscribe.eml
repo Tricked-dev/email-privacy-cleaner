@@ -1,0 +1,14 @@
+From: Newsletter <news@news.example.com>
+To: User <user@example.org>
+Subject: Weekly digest
+MIME-Version: 1.0
+List-Unsubscribe: <https://news.example.com/u?uid=42&utm_source=footer&tok=SECRET-TOKEN>, <mailto:unsub@news.example.com?subject=unsub>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body>
+<p><a href="https://shop.example.com/sale?id=1&utm_source=news&utm_campaign=spring">Shop the sale</a></p>
+<p><a href="https://news.example.com/u?uid=42&utm_source=footer&tok=SECRET-TOKEN">Unsubscribe</a></p>
+<img src="https://track.news.example.com/o.gif?uid=42" width="1" height="1" alt="">
+</body></html>

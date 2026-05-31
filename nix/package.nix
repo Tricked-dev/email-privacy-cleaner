@@ -23,9 +23,11 @@ let
   cargoToml = lib.importTOML (src + "/Cargo.toml");
   inherit (cargoToml.package) version;
 
+  # Always pin the feature set explicitly (the crate enables `network` by
+  # default). `cargoFeatures = [ ]` therefore yields a fully offline binary.
   featureArgs =
-    lib.optionalString (cargoFeatures != [ ])
-      "--no-default-features --features ${lib.concatStringsSep "," cargoFeatures}";
+    "--no-default-features"
+    + lib.optionalString (cargoFeatures != [ ]) " --features ${lib.concatStringsSep "," cargoFeatures}";
 
   # Arguments shared between the dependency-only build, the final build and the
   # check derivations so every step hits the same cargo artifact cache.

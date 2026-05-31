@@ -84,6 +84,26 @@ pub fn preflight_ok(url: &Url) -> bool {
     true
 }
 
+/// Fetch an external ClearURLs-format rule pack over HTTPS (opt-in, `network`
+/// feature only). The caller parses the returned JSON. This is a one-off,
+/// startup-time download (during `finalize`), not part of the per-message
+/// cleaning path, so it is exempt from the "no network during cleaning" rule.
+#[cfg(feature = "network")]
+pub fn fetch_rule_pack(url: &str, timeout_ms: u64) -> crate::error::Result<String> {
+    use std::time::Duration;
+    let timeout = Duration::from_millis(timeout_ms.max(1).max(5_000));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .user_agent(USER_AGENT)
+        .build();
+    agent
+        .get(url)
+        .call()
+        .map_err(|e| crate::error::CleanerError::Network(format!("fetching {url}: {e}")))?
+        .into_string()
+        .map_err(|e| crate::error::CleanerError::Network(format!("reading {url}: {e}")))
+}
+
 #[cfg(feature = "network")]
 mod network_impl {
     use super::*;
