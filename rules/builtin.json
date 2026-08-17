@@ -141,6 +141,12 @@
         "^https?://l[a-z]?\\.facebook\\.com/l\\.php\\?.*?u=(https?%3A%2F%2F[^&]*)"
       ]
     },
+    "github": {
+      "_comment": "GitHub notification-email attribution. `email_token` is a per-recipient open/click token appended to ordinary content links (issues, pulls, actions/runs, /settings/notifications) — stripping it just makes the link a normal logged-in visit. One-click unsubscribe is unaffected: it carries its token in the path (/notifications/unsubscribe-auth/<token>), not the query string.",
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?github\\.com",
+      "completeProvider": false,
+      "rules": ["email_source", "email_token"]
+    },
     "googleplay": {
       "_comment": "Play Store install-attribution param. Scoped to play.google.com rather than added to the `google` provider, since `referrer` is functional on other Google properties.",
       "urlPattern": "^https?://play\\.google\\.com",
