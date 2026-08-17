@@ -143,6 +143,17 @@ pub fn reencode_charset(s: &str, charset: Option<&str>) -> Option<Vec<u8>> {
             Some(bytes.into_owned())
         }
         _ => {
+            // WHATWG encoding index, so legacy charsets (windows-1256, koi8-r,
+            // shift_jis, …) re-encode instead of disabling the rewrite. The
+            // `output_encoding` check excludes UTF-16 and `replacement`, which
+            // WHATWG maps to UTF-8 output — writing that into a part declaring
+            // UTF-16 would corrupt it.
+            if let Some(enc) = encoding_rs::Encoding::for_label(cs.as_bytes()) {
+                if std::ptr::eq(enc, enc.output_encoding()) {
+                    let (bytes, _, _) = enc.encode(s);
+                    return Some(bytes.into_owned());
+                }
+            }
             if s.is_ascii() {
                 Some(s.as_bytes().to_vec())
             } else {
@@ -150,6 +161,19 @@ pub fn reencode_charset(s: &str, charset: Option<&str>) -> Option<Vec<u8>> {
             }
         }
     }
+}
+
+/// Decode raw part bytes using the part's declared charset, for the
+/// CTE-mismatch recovery path in [`crate::mime`]. Strict: `None` if the bytes
+/// aren't valid in that charset, rather than feeding U+FFFD into the rewriter.
+pub fn decode_charset(bytes: &[u8], charset: Option<&str>) -> Option<String> {
+    let cs = charset.unwrap_or("utf-8").trim().to_ascii_lowercase();
+    if let Some(enc) = encoding_rs::Encoding::for_label(cs.as_bytes()) {
+        return enc
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .map(|c| c.into_owned());
+    }
+    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -175,8 +199,34 @@ mod tests {
 
     #[test]
     fn unknown_charset_ascii_ok_nonascii_skipped() {
-        assert!(reencode_charset("plain ascii", Some("shift_jis")).is_some());
-        assert!(reencode_charset("caf\u{00e9}", Some("shift_jis")).is_none());
+        assert!(reencode_charset("plain ascii", Some("not-a-charset")).is_some());
+        assert!(reencode_charset("caf\u{00e9}", Some("not-a-charset")).is_none());
+    }
+
+    #[test]
+    fn whatwg_labels_reencode_instead_of_giving_up() {
+        // Previously anything outside utf-8/latin-1/windows-1252 was dropped,
+        // which silently disabled the rewrite for the whole part.
+        let bytes = reencode_charset("\u{645}\u{631}\u{62d}\u{628}\u{627}", Some("windows-1256"))
+            .expect("windows-1256 must be encodable");
+        assert_eq!(bytes, vec![0xE3, 0xD1, 0xCD, 0xC8, 0xC7]);
+        assert!(reencode_charset("\u{3053}", Some("shift_jis")).is_some());
+    }
+
+    #[test]
+    fn utf16_output_is_refused() {
+        // WHATWG maps utf-16 to utf-8 for output; writing utf-8 into a part
+        // that declares utf-16 would corrupt it, so non-ASCII must be refused.
+        assert!(reencode_charset("caf\u{00e9}", Some("utf-16")).is_none());
+        assert!(reencode_charset("caf\u{00e9}", Some("utf-16le")).is_none());
+    }
+
+    #[test]
+    fn decode_charset_roundtrips_legacy_bytes() {
+        let s = decode_charset(&[0xE3, 0xD1, 0xCD, 0xC8, 0xC7], Some("windows-1256")).unwrap();
+        assert_eq!(s, "\u{645}\u{631}\u{62d}\u{628}\u{627}");
+        // Invalid in the declared charset -> refuse rather than emit U+FFFD.
+        assert!(decode_charset(&[0xFF, 0xFE, 0x00], Some("utf-8")).is_none());
     }
 
     #[test]

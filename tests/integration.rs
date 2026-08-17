@@ -805,3 +805,131 @@ fn qp_encode(content: &[u8]) -> String {
     }
     out
 }
+
+/// Returns the value of an audit header from a cleaner result, if present.
+fn audit<'a>(r: &'a email_privacy_cleaner::CleanerResult, name: &str) -> Option<&'a str> {
+    r.audit_headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Build a single-part text/html message declaring `cte`, with `body` used as
+/// the body bytes verbatim.
+fn singlepart_html(cte: &str, charset: &str, body: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"From: a@b.example\r\nSubject: s\r\nMIME-Version: 1.0\r\n");
+    raw.extend_from_slice(format!("Content-Type: text/html; charset=\"{charset}\"\r\n").as_bytes());
+    raw.extend_from_slice(format!("Content-Transfer-Encoding: {cte}\r\n\r\n").as_bytes());
+    raw.extend_from_slice(body);
+    raw.extend_from_slice(b"\r\n");
+    raw
+}
+
+const PIXEL_HTML: &str = r#"<html><body><p>hi</p><a href="https://e.example/p?id=1&utm_source=news">x</a><img src="https://t.example/open.gif" width="1" height="1" alt=""></body></html>"#;
+
+/// An MTA that hands us an already-decoded body while still advertising the
+/// original CTE must not cause the message to be passed through untouched.
+#[test]
+fn cte_mismatch_quoted_printable_html_is_still_cleaned() {
+    let raw = singlepart_html("quoted-printable", "UTF-8", PIXEL_HTML.as_bytes());
+    let r = clean_message(&raw, &cfg()).unwrap();
+
+    assert_eq!(r.stats.html_parts, 1, "the html part must be counted");
+    assert_eq!(r.stats.pixels_removed, 1);
+    assert!(r.modified, "body must actually be rewritten");
+    assert_eq!(audit(&r, "X-Privacy-Cleaner-Cte-Mismatch-Parts"), Some("1"));
+
+    let out = as_str(&r.cleaned);
+    assert!(!out.contains("open.gif"), "pixel survived: {out}");
+    assert!(!out.contains("utm_source"));
+    // Written back verbatim: we must not QP-encode a body that arrived decoded.
+    assert!(!out.contains("=3D"), "body was double-encoded: {out}");
+}
+
+#[test]
+fn cte_mismatch_base64_html_is_still_cleaned() {
+    let raw = singlepart_html("base64", "UTF-8", PIXEL_HTML.as_bytes());
+    let r = clean_message(&raw, &cfg()).unwrap();
+
+    assert_eq!(r.stats.html_parts, 1);
+    assert_eq!(r.stats.pixels_removed, 1);
+    assert!(r.modified);
+    assert_eq!(audit(&r, "X-Privacy-Cleaner-Cte-Mismatch-Parts"), Some("1"));
+    assert!(!as_str(&r.cleaned).contains("open.gif"));
+}
+
+/// The recovery path must not hijack a correctly-encoded part: a real QP body
+/// still goes through the normal decode path and stays QP on the way out.
+#[test]
+fn correctly_encoded_part_does_not_use_cte_mismatch_path() {
+    let encoded = PIXEL_HTML.replace('=', "=3D");
+    let raw = singlepart_html("quoted-printable", "UTF-8", encoded.as_bytes());
+    let r = clean_message(&raw, &cfg()).unwrap();
+
+    assert_eq!(r.stats.html_parts, 1);
+    assert_eq!(r.stats.pixels_removed, 1);
+    assert!(r.modified);
+    assert_eq!(
+        audit(&r, "X-Privacy-Cleaner-Cte-Mismatch-Parts"),
+        None,
+        "healthy QP part must not be treated as a CTE mismatch"
+    );
+    let out = as_str(&r.cleaned);
+    assert!(!out.contains("open.gif"));
+    assert!(out.contains("=3D"), "output should remain QP-encoded");
+}
+
+/// A part whose body is not markup (e.g. a genuinely broken base64 payload)
+/// must be left alone rather than parsed as HTML.
+#[test]
+fn cte_mismatch_path_ignores_non_markup_bodies() {
+    let raw = singlepart_html("base64", "UTF-8", b"plain text, not base64!");
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert_eq!(r.stats.html_parts, 0);
+    assert!(!r.modified);
+    assert_eq!(audit(&r, "X-Privacy-Cleaner-Cte-Mismatch-Parts"), None);
+}
+
+/// windows-1256 used to fall through `reencode_charset` and silently disable
+/// the rewrite, while the stats still reported a removal.
+#[test]
+fn windows_1256_part_is_cleaned_and_reencoded() {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"<html><body><p>");
+    body.extend_from_slice(&[0xE3, 0xD1, 0xCD, 0xC8, 0xC7]); // مرحبا in cp1256
+    body.extend_from_slice(
+        br#"</p><a href="https://e.example/p?id=1&utm_source=news">x</a></body></html>"#,
+    );
+    let raw = singlepart_html("7bit", "windows-1256", &body);
+
+    let r = clean_message(&raw, &cfg()).unwrap();
+    assert!(r.modified, "windows-1256 part must be rewritten");
+    assert_eq!(audit(&r, "X-Privacy-Cleaner-Unencodable-Parts"), None);
+    assert!(!as_str(&r.cleaned).contains("utm_source"));
+    // Still cp1256 single bytes, not UTF-8 two-byte sequences.
+    assert!(r.cleaned.windows(1).any(|w| w == [0xE3]));
+    assert!(!r.cleaned.windows(2).any(|w| w == [0xD9, 0x85]));
+    assert!(as_str(&r.cleaned).contains("windows-1256"));
+}
+
+/// Where a rewrite genuinely cannot be written back, that must be surfaced
+/// rather than reported as a clean pass.
+#[test]
+fn unencodable_charset_is_surfaced_not_silent() {
+    let html = r#"<html><body><p>caf\u{e9}</p><a href="https://e.example/p?utm_source=news">x</a></body></html>"#
+        .replace("\\u{e9}", "\u{e9}");
+    let utf16: Vec<u8> = html.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let b64 = STANDARD.encode(&utf16);
+    let raw = singlepart_html("base64", "utf-16", b64.as_bytes());
+
+    let r = clean_message(&raw, &cfg()).unwrap();
+    // utf-16 output is not representable, so the rewrite cannot be applied.
+    assert_eq!(r.stats.urls_cleaned, 1, "the tracker is still detected");
+    assert!(!r.modified, "but the body must be left byte-identical");
+    assert_eq!(
+        audit(&r, "X-Privacy-Cleaner-Unencodable-Parts"),
+        Some("1"),
+        "a computed-but-undeliverable rewrite must be reported, not silent"
+    );
+}

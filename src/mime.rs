@@ -13,7 +13,7 @@ use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
 use url::Url;
 
 use crate::config::{CleanerConfig, Mode};
-use crate::encoding::{encode_body, reencode_charset};
+use crate::encoding::{decode_charset, encode_body, reencode_charset};
 use crate::error::{CleanerError, Result};
 use crate::html::{clean_html_ctx, LinkContext};
 use crate::url_clean::clean_url;
@@ -104,6 +104,11 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
     // surface this in an audit header so a deployment can tell "I saw nothing
     // to clean" apart from "I saw a giant part I refused to touch".
     let mut skipped_oversized_parts: usize = 0;
+    // Parts recovered by the CTE-mismatch fallback below.
+    let mut cte_mismatch_parts: usize = 0;
+    // Cleaned but not written back: the result would not re-encode into the
+    // part's declared charset. Counted so the stats can't claim a phantom edit.
+    let mut unencodable_parts: usize = 0;
     // mail-parser can list the same part id in both `html_body` and
     // `text_body` (e.g. a single text/html part used as the only body). Track
     // ids we've already produced a replacement for so we never queue two
@@ -137,9 +142,82 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
             stats.pings_stripped += res.pings_stripped;
 
             if eff.mode.is_enforce() && res.changed {
-                if let Some(rep) = build_replacement(raw, part, res.html.as_bytes(), &line_ending) {
-                    processed_parts.insert(part_id);
-                    replacements.push(rep);
+                match build_replacement(raw, part, res.html.as_bytes(), &line_ending) {
+                    Some(rep) => {
+                        processed_parts.insert(part_id);
+                        replacements.push(rep);
+                    }
+                    None => unencodable_parts += 1,
+                }
+            }
+        }
+    }
+
+    // ---- text/html parts the parser could not decode (CTE mismatch) ----
+    //
+    // Some MTAs (Stalwart) hand a milter an already-decoded body while still
+    // sending the original `Content-Transfer-Encoding` header. mail-parser
+    // decodes a second time, fails, and drops the part from `html_body`, so the
+    // loop above never sees it. Recover by content type and treat the raw bytes
+    // as the body; replacements go back verbatim since they aren't encoded.
+    if eff.clean_html {
+        let html_body_ids: HashSet<u32> = message.html_body.iter().copied().collect();
+        for part_id in 0..message.parts.len() as u32 {
+            if html_body_ids.contains(&part_id) || processed_parts.contains(&part_id) {
+                continue;
+            }
+            let part = match message.part(part_id) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !declares_html(part) {
+                continue;
+            }
+            let start = part.offset_body as usize;
+            let end = part.offset_end as usize;
+            if start > end || end > raw.len() {
+                continue;
+            }
+            let charset = part
+                .content_type()
+                .and_then(|ct| ct.attribute("charset"))
+                .map(|s| s.to_string());
+            let text = match decode_charset(&raw[start..end], charset.as_deref()) {
+                Some(t) => t,
+                None => continue,
+            };
+            // Real HTML has a tag in it; base64 never can.
+            if !text.contains('<') {
+                continue;
+            }
+
+            stats.html_parts += 1;
+            cte_mismatch_parts += 1;
+
+            if text.len() > eff.max_html_part_size {
+                skipped_oversized_parts += 1;
+                continue;
+            }
+
+            let res = clean_html_ctx(&text, None, eff, &link_ctx)?;
+            stats.urls_cleaned += res.urls_cleaned;
+            stats.redirects_unwrapped += res.redirects_unwrapped;
+            stats.pixels_removed += res.pixels_removed;
+            stats.pings_stripped += res.pings_stripped;
+
+            if eff.mode.is_enforce() && res.changed {
+                match build_replacement_with(
+                    raw,
+                    part,
+                    res.html.as_bytes(),
+                    &line_ending,
+                    mail_parser::Encoding::None,
+                ) {
+                    Some(rep) => {
+                        processed_parts.insert(part_id);
+                        replacements.push(rep);
+                    }
+                    None => unencodable_parts += 1,
                 }
             }
         }
@@ -162,9 +240,12 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
             let (new_text, n) = clean_text_urls(text, eff);
             stats.urls_cleaned += n;
             if eff.mode.is_enforce() && n > 0 {
-                if let Some(rep) = build_replacement(raw, part, new_text.as_bytes(), &line_ending) {
-                    processed_parts.insert(part_id);
-                    replacements.push(rep);
+                match build_replacement(raw, part, new_text.as_bytes(), &line_ending) {
+                    Some(rep) => {
+                        processed_parts.insert(part_id);
+                        replacements.push(rep);
+                    }
+                    None => unencodable_parts += 1,
                 }
             }
         }
@@ -194,6 +275,18 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
         audit_headers.push((
             "X-Privacy-Cleaner-Skipped-Oversized-Parts".into(),
             skipped_oversized_parts.to_string(),
+        ));
+    }
+    if cte_mismatch_parts > 0 {
+        audit_headers.push((
+            "X-Privacy-Cleaner-Cte-Mismatch-Parts".into(),
+            cte_mismatch_parts.to_string(),
+        ));
+    }
+    if unencodable_parts > 0 {
+        audit_headers.push((
+            "X-Privacy-Cleaner-Unencodable-Parts".into(),
+            unencodable_parts.to_string(),
         ));
     }
     if eff.surface_unsubscribe {
@@ -226,6 +319,18 @@ pub fn clean_message(raw: &[u8], config: &CleanerConfig) -> Result<CleanerResult
         mode: eff.mode,
         error: None,
     })
+}
+
+/// Returns `true` if the part's `Content-Type` is `text/html`.
+fn declares_html(part: &mail_parser::MessagePart) -> bool {
+    part.content_type()
+        .map(|ct| {
+            ct.ctype().eq_ignore_ascii_case("text")
+                && ct
+                    .subtype()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("html"))
+        })
+        .unwrap_or(false)
 }
 
 /// Extract the sender domain (lower-cased) from the message `From:` header.
@@ -322,6 +427,19 @@ fn build_replacement(
     new_content: &[u8],
     line_ending: &[u8],
 ) -> Option<Replacement> {
+    build_replacement_with(raw, part, new_content, line_ending, part.encoding)
+}
+
+/// As [`build_replacement`], but with an explicit content-transfer-encoding.
+/// The CTE-mismatch path passes `Encoding::None`, since re-applying the declared
+/// encoding to an already-decoded body would double-encode it.
+fn build_replacement_with(
+    raw: &[u8],
+    part: &mail_parser::MessagePart,
+    new_content: &[u8],
+    line_ending: &[u8],
+    encoding: mail_parser::Encoding,
+) -> Option<Replacement> {
     let start = part.offset_body as usize;
     let end = part.offset_end as usize;
     if start > end || end > raw.len() {
@@ -342,7 +460,7 @@ fn build_replacement(
         Err(_) => new_content.to_vec(),
     };
 
-    let encoded = encode_body(&charset_bytes, part.encoding, line_ending);
+    let encoded = encode_body(&charset_bytes, encoding, line_ending);
 
     // When the part's Content-Transfer-Encoding is none (i.e. it was declared
     // 7bit/8bit/binary, which `mail-parser` collapses into `Encoding::None`),
@@ -352,7 +470,7 @@ fn build_replacement(
     // DKIM expectations. If the original slice already contained high bytes,
     // the message was already 8bit-in-7bit-clothing and we're not making it
     // worse.
-    if matches!(part.encoding, mail_parser::Encoding::None) {
+    if matches!(encoding, mail_parser::Encoding::None) {
         let original_has_high = original_slice.iter().any(|&b| b >= 0x80);
         let encoded_has_high = encoded.iter().any(|&b| b >= 0x80);
         if encoded_has_high && !original_has_high {
