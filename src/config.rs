@@ -66,13 +66,31 @@ pub const DEFAULT_SENSITIVE_SENDER_DOMAINS: &[&str] = &[
     "auth0.com",
     "duosecurity.com",
     // Payments / finance
+    //
+    // Matching is a literal host-suffix compare, so ccTLD storefronts do NOT
+    // inherit from the .com entry — `paypal.nl` has to be listed separately or
+    // it is treated as an ordinary marketing sender.
     "paypal.com",
+    "paypal.nl",
+    "paypal.be",
+    "paypal.de",
+    "paypal.fr",
+    "paypal.it",
+    "paypal.es",
+    "paypal.co.uk",
     "stripe.com",
     "wise.com",
     "revolut.com",
     "americanexpress.com",
     "chase.com",
     "bankofamerica.com",
+    "kraken.com",
+    "degiro.com",
+    "degiro.nl",
+    "rabobank.nl",
+    // Government / national identity
+    "overheid.nl",
+    "digid.nl",
     // Auth/notification senders for common services
     "github.com",
     "gitlab.com",
