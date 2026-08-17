@@ -51,7 +51,8 @@
         "_x_tr_.*",
         "ito",
         "Echobox",
-        "mostrecentleadsource"
+        "mostrecentleadsource",
+        "ahoy_click"
       ]
     },
     "amazon": {
@@ -59,6 +60,7 @@
       "completeProvider": false,
       "rules": [
         "ref",
+        "ref_",
         "p[fd]_rd_[a-z]*",
         "_encoding",
         "psc",
@@ -139,6 +141,18 @@
         "^https?://l[a-z]?\\.facebook\\.com/l\\.php\\?.*?u=(https?%3A%2F%2F[^&]*)"
       ]
     },
+    "googleplay": {
+      "_comment": "Play Store install-attribution param. Scoped to play.google.com rather than added to the `google` provider, since `referrer` is functional on other Google properties.",
+      "urlPattern": "^https?://play\\.google\\.com",
+      "completeProvider": false,
+      "rules": ["referrer"]
+    },
+    "paypal": {
+      "_comment": "PayPal notification-email telemetry. `unptid`/`calc`/`unp_tpcid`/`xt`/`xe`/`link_ref` are open+click attribution only; account, transaction and token params are left untouched. Note paypal.com is also a built-in sensitive sender, so these only apply to ccTLD senders (paypal.nl etc.) unless a SenderPolicy re-enables cleaning.",
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?paypal(?:\\.[a-z]{2,}){1,}",
+      "completeProvider": false,
+      "rules": ["link_ref", "unptid", "calc", "unp_tpcid", "xt", "xe"]
+    },
     "instagram": {
       "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?instagram\\.com",
       "completeProvider": false,
@@ -147,7 +161,21 @@
     "linkedin": {
       "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:linkedin\\.com|lnkd\\.in)",
       "completeProvider": false,
-      "rules": ["trk", "trkinfo", "originalsubdomain", "midtoken", "eid", "otptoken", "li_fat_id", "refid"]
+      "_comment": "`midSig`/`_sig` are per-recipient email attribution signatures and `lipi` is the page-instance tracker; the bare `sig` param is deliberately NOT listed because LinkedIn uses it functionally (e.g. /comm/psettings/email/confirm).",
+      "rules": [
+        "trk",
+        "trkinfo",
+        "trkEmail",
+        "originalsubdomain",
+        "midtoken",
+        "midSig",
+        "_sig",
+        "lipi",
+        "eid",
+        "otptoken",
+        "li_fat_id",
+        "refid"
+      ]
     },
     "reddit": {
       "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:reddit\\.com|redd\\.it)",
@@ -333,6 +361,11 @@
       "redirections": [
         "^https?://(?:[a-z0-9-]+\\.)*?safelink\\.emails\\.azure\\.net/redirect/?\\?.*?destination=([^&]+)"
       ]
+    },
+    "customerio-pixel": {
+      "_comment": "Customer.io open beacon. Scoped to the /e/o/ path so the click-tracking links the same host serves under /e/c/ keep working (completeProvider only ever affects images, but the narrower pattern also keeps content images safe).",
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?customeriomail\\.com/e/o/",
+      "completeProvider": true
     },
     "sendtric-pixel": {
       "_comment": "Sendtric email countdown timer service, embedded as a remote image and used as an open beacon.",
