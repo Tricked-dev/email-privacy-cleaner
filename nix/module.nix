@@ -153,7 +153,8 @@ in
         Structured sources are configured through {option}`settings` using
         `rule_pack_sources`. Each entry uses `source`, with `path` and `url`
         accepted as aliases; `format` is optional and accepts `auto`,
-        `clear-urls`, `brave-clean-urls`, `brave-debounce`, or `adguard`.
+        `clear-urls`, `brave-clean-urls`, `brave-debounce`, or canonical
+        `ad-guard` (`adguard` is also accepted for compatibility).
         Optional `usage = "mail-beacon"` permits modifierless AdGuard image
         rules. The legacy `rule_packs` and `rule_pack_urls` arrays remain
         supported and mean ClearURLs JSON.

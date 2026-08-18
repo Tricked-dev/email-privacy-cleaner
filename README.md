@@ -279,8 +279,9 @@ These are the supported cleaner sources and their intended scope:
    browser preference are skipped. Ambiguous destinations, invalid encoding,
    missing captures, and destinations that fail the safety checks produce no
    rewrite.
-5. **Supported AdGuard subset (`adguard`)** — explicit `$removeparam=name`,
-   safe `$removeparam=/regex/` rules, supported URL scopes, and explicit
+5. **Supported AdGuard subset (`ad-guard`; `adguard` is also accepted)** —
+   explicit `$removeparam=name`, safe `$removeparam=/regex/` rules, supported
+   URL scopes, and explicit
    `$image` rules. Unsupported modifiers and browser-only behavior are skipped
    rather than approximated.
 6. **AdGuard-format mail-beacon lists** — for example, Mail Tracking
@@ -289,18 +290,23 @@ These are the supported cleaner sources and their intended scope:
    contexts. It does not affect ordinary links. Arbitrary modifierless blocking
    rules from an AdGuard list are not automatically treated as email pixels.
 
-### Recommended starter list
+### Source repositories and raw files
 
-For a practical first configuration, enable sources in this order:
+The project bundles only the built-in row. The other rows are optional external
+sources; review upstream changes and load them in report-only mode first.
 
-1. Built-in original rules (always present).
-2. ClearURLs Rules JSON (`clear-urls`) for broad provider coverage.
-3. Brave Clean URLs (`brave-clean-urls`) for additional raw, exact,
-   case-sensitive parameter names.
-4. Brave Debounce (`brave-debounce`) for offline unwrapping of supported
-   redirect links.
-5. One reviewed AdGuard-format mail-beacon list, explicitly tagged with
-   `usage = "mail-beacon"`, for image and CSS tracking pixels.
+| Cleaner | Format | Repository | Raw/download source |
+| --- | --- | --- | --- |
+| Built-in original rules | built-in | [project rules](https://github.com/Tricked-dev/email-privacy-cleaner/tree/master/rules) | [builtin.json](https://raw.githubusercontent.com/Tricked-dev/email-privacy-cleaner/master/rules/builtin.json) |
+| ClearURLs Rules | `clear-urls` | [ClearURLs/Rules](https://github.com/ClearURLs/Rules) | [data.min.json](https://rules2.clearurls.xyz/data.min.json) |
+| Brave Clean URLs | `brave-clean-urls` | [brave/adblock-lists](https://github.com/brave/adblock-lists/tree/master/brave-lists) | [clean-urls.json](https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/clean-urls.json) |
+| Brave Debounce | `brave-debounce` | [brave/adblock-lists](https://github.com/brave/adblock-lists/tree/master/brave-lists) | [debounce.json](https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/debounce.json) |
+| AdGuard URL tracking | `ad-guard` (`adguard` accepted) | [AdguardFilters/TrackParamFilter](https://github.com/AdguardTeam/AdguardFilters/tree/master/TrackParamFilter) | [general_url.txt](https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/TrackParamFilter/sections/general_url.txt) |
+| AdGuard mail tracking | `ad-guard` (`adguard` accepted), `usage = "mail-beacon"` | [AdguardFilters/MailTrackingFilter](https://github.com/AdguardTeam/AdguardFilters/tree/master/MailTrackingFilter) | [Mail Tracking Protection](https://filters.adtidy.org/extension/chromium/filters/25.txt) |
+
+Recommended starter order: built-in rules, ClearURLs, Brave Clean URLs, Brave
+Debounce, then one reviewed AdGuard mail-beacon source with
+`usage = "mail-beacon"`.
 
 Start with `mode = "report-only"`, inspect the audit headers and
 `rule-stats --json`, and switch to `mode = "enforce"` after checking
@@ -325,7 +331,7 @@ format = "brave-debounce"
 
 [[rule_pack_sources]]
 source = "/etc/email-privacy-cleaner/mail-beacons.txt"
-format = "adguard"
+format = "ad-guard"
 usage = "mail-beacon"
 ```
 
@@ -372,7 +378,7 @@ For AdGuard input, modifierless image rules require an explicit purpose:
 ```toml
 [[rule_pack_sources]]
 source = "/etc/email-privacy-cleaner/mail-beacons.txt"
-format = "adguard"
+format = "ad-guard"
 usage = "mail-beacon"
 ```
 

@@ -44,6 +44,7 @@ pub enum RulePackFormat {
     /// Brave `debounce.json`.
     BraveDebounce,
     /// AdGuard network-filter syntax.
+    #[serde(alias = "adguard")]
     AdGuard,
 }
 

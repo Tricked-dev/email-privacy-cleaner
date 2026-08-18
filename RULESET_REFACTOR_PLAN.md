@@ -412,7 +412,7 @@ structured source form for format and purpose overrides:
 ~~~toml
 [[rule_sources]]
 url = "https://example.invalid/mail-tracking.txt"
-format = "adguard"
+format = "ad-guard"
 usage = "mail-beacon"
 ~~~
 

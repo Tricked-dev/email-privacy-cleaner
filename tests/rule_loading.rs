@@ -162,6 +162,26 @@ fn structured_sources_preserve_format_and_usage_metadata() {
 }
 
 #[test]
+fn adguard_format_accepts_canonical_and_compatibility_spellings() {
+    for spelling in ["ad-guard", "adguard"] {
+        let config = CleanerConfig::parse_toml_str(&format!(
+            r#"
+                [[rule_pack_sources]]
+                source = "fixture://adguard-{spelling}"
+                format = "{spelling}"
+            "#
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.rule_pack_sources[0].format,
+            Some(RulePackFormat::AdGuard),
+            "format spelling {spelling:?} should deserialize"
+        );
+    }
+}
+
+#[test]
 fn duplicate_sources_are_loaded_once() {
     let source = "fixture://duplicate-pack";
     let mut config = CleanerConfig::from_toml_str_unfinalized(TOML_WITHOUT_PACKS).unwrap();

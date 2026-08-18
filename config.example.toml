@@ -156,7 +156,8 @@ disabled_providers = [
 # The string arrays below are supported and mean ClearURLs JSON.
 # Structured entries use `source`; `path` and `url` are accepted aliases.
 # `format` is optional and accepts `auto`, `clear-urls`, `brave-clean-urls`,
-# `brave-debounce`, or `adguard`. `usage` is optional and accepts
+# `brave-debounce`, or canonical `ad-guard` (`adguard` is also accepted for
+# compatibility). `usage` is optional and accepts
 # only `mail-beacon`.
 # Patterns using regex features unsupported by Rust's linear-time engine are
 # skipped individually; the rest of the pack still loads.
@@ -185,8 +186,36 @@ rule_pack_urls = [
 
 #[[rule_pack_sources]]
 #url = "https://example.invalid/adguard.txt"
-#format = "adguard"
+#format = "ad-guard"
 #usage = "mail-beacon"  # permits modifierless AdGuard image rules
+
+# Recommended source order and purpose:
+# 1. Built-in rules are always loaded.
+# 2. ClearURLs (`clear-urls`) adds broad provider-specific URL cleaning.
+# 3. Brave Clean URLs (`brave-clean-urls`) adds raw, case-sensitive parameter rules.
+# 4. Brave Debounce (`brave-debounce`) adds supported offline redirect unwrapping.
+# 5. A reviewed AdGuard mail list uses `ad-guard` plus `usage = "mail-beacon"`
+#    for image/CSS beacon rules. Start in report-only mode and inspect the
+#    resulting rule-stats/audit output before enabling enforcement.
+#
+# For a complete online starter setup, uncomment one source at a time and
+# inspect its report before adding the next one:
+# [[rule_pack_sources]]
+# source = "https://rules2.clearurls.xyz/data.min.json"
+# format = "clear-urls"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/clean-urls.json"
+# format = "brave-clean-urls"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/debounce.json"
+# format = "brave-debounce"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/TrackParamFilter/sections/general_url.txt"
+# format = "ad-guard"
+# [[rule_pack_sources]]
+# source = "https://filters.adtidy.org/extension/chromium/filters/25.txt"
+# format = "ad-guard"
+# usage = "mail-beacon"
 
 # Resource bounds for structured and string-array external sources. Defaults:
 # 5 MiB per source, 25 MiB total, 32 sources, 50,000 external rules,
