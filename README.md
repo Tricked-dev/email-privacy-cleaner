@@ -298,7 +298,7 @@ sources; review upstream changes and load them in report-only mode first.
 | Cleaner | Format | Repository | Raw/download source |
 | --- | --- | --- | --- |
 | Built-in original rules | built-in | [project rules](https://github.com/Tricked-dev/email-privacy-cleaner/tree/master/rules) | [builtin.json](https://raw.githubusercontent.com/Tricked-dev/email-privacy-cleaner/master/rules/builtin.json) |
-| ClearURLs Rules | `clear-urls` | [ClearURLs/Rules](https://github.com/ClearURLs/Rules) | [data.min.json](https://rules2.clearurls.xyz/data.min.json) |
+| ClearURLs Rules | `clear-urls` | [ClearURLs/Rules](https://github.com/ClearURLs/Rules) | [data.min.json](https://raw.githubusercontent.com/ClearURLs/Rules/master/data.min.json) |
 | Brave Clean URLs | `brave-clean-urls` | [brave/adblock-lists](https://github.com/brave/adblock-lists/tree/master/brave-lists) | [clean-urls.json](https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/clean-urls.json) |
 | Brave Debounce | `brave-debounce` | [brave/adblock-lists](https://github.com/brave/adblock-lists/tree/master/brave-lists) | [debounce.json](https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/debounce.json) |
 | AdGuard URL tracking | `ad-guard` (`adguard` accepted) | [AdguardFilters/TrackParamFilter](https://github.com/AdguardTeam/AdguardFilters/tree/master/TrackParamFilter) | [general_url.txt](https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/TrackParamFilter/sections/general_url.txt) |
