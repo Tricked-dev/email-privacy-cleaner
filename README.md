@@ -254,14 +254,80 @@ forwards, so they are intended for deliberate debugging only.
 
 ## External rule packs
 
-The binary includes an original built-in ruleset from
-[`rules/builtin.json`](rules/builtin.json). External packs augment it; they do
-not replace the built-ins. Supported inputs are:
+The binary includes the original built-in ruleset from
+[`rules/builtin.json`](rules/builtin.json). It is always present; external
+packs add to it and do not replace it.
 
-- ClearURLs Rules JSON;
-- Brave Clean URLs JSON;
-- Brave Debounce JSON; and
-- the supported AdGuard filter subset.
+### Complete supported list
+
+These are the supported cleaner sources and their intended scope:
+
+1. **Built-in original rules** — always loaded. They cover the project's
+   reviewed tracking parameters, provider rules, known redirectors, pixel
+   domains, and other conservative email-cleaning behavior.
+2. **ClearURLs Rules JSON (`clear-urls`)** — provider-specific URL cleaning and
+   redirect rules from the ClearURLs format. Parameter names follow this
+   project's ClearURLs-compatible decoded, case-insensitive matching semantics;
+   provider scope and provider exceptions remain attached to their own rules.
+3. **Brave Clean URLs (`brave-clean-urls`)** — exact query-parameter cleaning
+   from Brave's Clean URLs list. Matching uses the raw query key and is
+   case-sensitive, so encoded and decoded spellings are distinct. A key is
+   removed only when its query segment contains `=`.
+4. **Brave Debounce (`brave-debounce`)** — offline redirect unwrapping for
+   supported query-parameter, Base64, regex-path, and regex-path-template
+   actions, including `prepend_scheme` where specified. Rules that require a
+   browser preference are skipped. Ambiguous destinations, invalid encoding,
+   missing captures, and destinations that fail the safety checks produce no
+   rewrite.
+5. **Supported AdGuard subset (`adguard`)** — explicit `$removeparam=name`,
+   safe `$removeparam=/regex/` rules, supported URL scopes, and explicit
+   `$image` rules. Unsupported modifiers and browser-only behavior are skipped
+   rather than approximated.
+6. **AdGuard-format mail-beacon lists** — for example, Mail Tracking
+   Protection loaded with `usage = "mail-beacon"`. This purpose tag permits
+   applicable modifierless image-beacon rules in email image and CSS-image
+   contexts. It does not affect ordinary links. Arbitrary modifierless blocking
+   rules from an AdGuard list are not automatically treated as email pixels.
+
+### Recommended starter list
+
+For a practical first configuration, enable sources in this order:
+
+1. Built-in original rules (always present).
+2. ClearURLs Rules JSON (`clear-urls`) for broad provider coverage.
+3. Brave Clean URLs (`brave-clean-urls`) for additional raw, exact,
+   case-sensitive parameter names.
+4. Brave Debounce (`brave-debounce`) for offline unwrapping of supported
+   redirect links.
+5. One reviewed AdGuard-format mail-beacon list, explicitly tagged with
+   `usage = "mail-beacon"`, for image and CSS tracking pixels.
+
+Start with `mode = "report-only"`, inspect the audit headers and
+`rule-stats --json`, and switch to `mode = "enforce"` after checking
+representative newsletters, authentication links, payment messages, and
+unsubscribe links. A starter configuration using reserved example paths looks
+like this:
+
+```toml
+mode = "report-only"
+
+[[rule_pack_sources]]
+source = "/etc/email-privacy-cleaner/clearurls.json"
+format = "clear-urls"
+
+[[rule_pack_sources]]
+source = "/etc/email-privacy-cleaner/brave-clean-urls.json"
+format = "brave-clean-urls"
+
+[[rule_pack_sources]]
+source = "/etc/email-privacy-cleaner/brave-debounce.json"
+format = "brave-debounce"
+
+[[rule_pack_sources]]
+source = "/etc/email-privacy-cleaner/mail-beacons.txt"
+format = "adguard"
+usage = "mail-beacon"
+```
 
 ### Local pack: recommended
 
