@@ -424,6 +424,13 @@ email-privacy-milter --config config.toml --listen 127.0.0.1:11333
 `--listen` overrides the config value. `--rule-pack PATH` is repeatable and
 augments configured ClearURLs-format packs.
 
+On Linux, the daemon also accepts one systemd-activated TCP listener using the
+standard `LISTEN_PID`/`LISTEN_FDS` contract (file descriptor 3). It accepts and
+negotiates the queued milter connection while external rule packs are parsed
+and compiled, then waits for the finalized immutable rules only at
+end-of-message. This overlaps useful protocol work without using a rule cache
+or processing mail against a partial ruleset.
+
 ### Stalwart
 
 Point Stalwart's DATA-stage milter integration at the daemon. The existing
@@ -492,6 +499,13 @@ usual loopback connection. The module runs the daemon as a dynamic user with a
 read-only filesystem, no capabilities, resource ceilings, and systemd network
 restrictions. When listening on loopback, the service itself is restricted to
 loopback networking; use `rulePacks` for build-time remote pack fetching.
+`socketActivation` defaults to `true`. The module enables
+`email-privacy-milter.socket` under `sockets.target`, while leaving the service
+out of the boot targets; systemd starts the service when Stalwart's first
+connection is queued. The service does not wait for `network.target` on this
+path because PID 1 has already bound the listener. Set `socketActivation =
+false` to start the service under `multi-user.target` and let it bind `listen`
+itself.
 
 ## Audit headers
 

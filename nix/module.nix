@@ -82,6 +82,18 @@ in
       '';
     };
 
+    socketActivation = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Let systemd own the TCP listener and start the milter on the first
+        queued connection. The daemon consumes the single inherited socket at
+        file descriptor 3 and overlaps rule preparation with milter protocol
+        negotiation. Disable this to keep the daemon running continuously and
+        let it bind {option}`listen` itself.
+      '';
+    };
+
     settings = lib.mkOption {
       type = tomlFormat.type;
       default = { };
@@ -209,11 +221,30 @@ in
       }
     );
 
+    systemd.sockets.email-privacy-milter = lib.mkIf cfg.socketActivation {
+      description = "Socket for email privacy cleaner milter activation";
+      documentation = [ "https://github.com/tricked-dev/email-privacy-cleaner" ];
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ cfg.listen ];
+      socketConfig = {
+        # One long-running daemon consumes the listening socket. With
+        # Accept=false systemd passes that socket itself as fd 3 instead of
+        # spawning a service instance for each connection.
+        Accept = false;
+        NoDelay = true;
+        Backlog = 128;
+      };
+    };
+
     systemd.services.email-privacy-milter = {
       description = "Email privacy cleaner milter daemon";
       documentation = [ "https://github.com/tricked-dev/email-privacy-cleaner" ];
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
+      # systemd gives a same-named socket an implicit Before= relationship to
+      # the service it activates. Avoid putting network.target on the socket
+      # activated startup path: PID 1 already owns the bound listener, so the
+      # daemon has no network setup to wait for.
+      after = lib.optionals (!cfg.socketActivation) [ "network.target" ];
+      wantedBy = lib.optionals (!cfg.socketActivation) [ "multi-user.target" ];
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (

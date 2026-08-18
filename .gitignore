@@ -6,3 +6,6 @@
 /result
 /result-*
 .direnv/
+
+# Local startup/first-mail profiling corpus and traces.
+/.bench/
