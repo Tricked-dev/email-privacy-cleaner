@@ -1,8 +1,7 @@
 //! Characterization tests for the ruleset loading/finalization contract.
 //!
 //! These tests specify the loader, limits, reporting, and sender-store
-//! contracts in `RULESET_REFACTOR_PLAN.md`. They exercise the public facade
-//! and its immutable compiled store.
+//! contracts. They exercise the public facade and its immutable compiled store.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

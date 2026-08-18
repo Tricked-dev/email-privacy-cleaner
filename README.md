@@ -601,5 +601,4 @@ pack fetching and network redirect resolution do not.
 ## Contributing and design
 
 Development, test, benchmark, and release notes are in
-[`CONTRIBUTING.md`](CONTRIBUTING.md). The rule-engine design detail lives in
-[`RULESET_REFACTOR_PLAN.md`](RULESET_REFACTOR_PLAN.md).
+[`CONTRIBUTING.md`](CONTRIBUTING.md).

@@ -43,11 +43,6 @@ rules/builtin.json                 built-in rules
 tests/fixtures/                    synthetic message fixtures
 ```
 
-The detailed rule-engine contract, supported external formats, limits, and
-rule-engine rationale live in
-[`RULESET_REFACTOR_PLAN.md`](RULESET_REFACTOR_PLAN.md). Keep design detail there
-instead of duplicating it in general project files.
-
 ## Public library API
 
 The package contains a reusable Rust library in addition to the two binaries:
@@ -165,9 +160,7 @@ When adding an option:
    [`config.example.toml`](config.example.toml);
 2. update the README only when the option matters to normal operation or
    safety;
-3. keep detailed rule-engine design in
-   [`RULESET_REFACTOR_PLAN.md`](RULESET_REFACTOR_PLAN.md); and
-4. make examples use reserved domains and non-secret synthetic values.
+3. make examples use reserved domains and non-secret synthetic values.
 
 ## Release automation
 
