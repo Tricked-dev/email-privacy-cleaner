@@ -354,8 +354,8 @@ fn split_param_patterns(list: &[String]) -> (HashSet<String>, Vec<String>) {
     (set, prefixes)
 }
 
-/// The public configuration exposes its source lists for compatibility, so
-/// callers can mutate them after a finalization. Keep a compact description of
+/// The public configuration exposes its source lists so callers can mutate
+/// them after finalization. Keep a compact description of
 /// the inputs that affect the derived lookup tables and compiled ruleset. This
 /// lets repeated finalization be idempotent without making those public fields
 /// private or requiring callers to manually invalidate a cache.
@@ -400,7 +400,7 @@ impl CleanerConfig {
         Ok(cfg)
     }
 
-    /// Compatibility spelling for the unfinalized parse path.
+    /// Compatibility alias for the unfinalized parse path.
     pub fn from_toml_str_unfinalized(s: &str) -> Result<Self> {
         Self::parse_toml_str(s)
     }

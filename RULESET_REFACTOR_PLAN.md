@@ -34,12 +34,11 @@ blocked by external infrastructure.
 
 ## Compatibility decisions recorded up front
 
-- `rawRules` are characterized first. They are currently publicly compiled and
-  callable but are not part of the ordinary cleaning path. This refactor will
-  not silently activate them; activation requires a separate approved change.
+- `rawRules` are public and callable but are not part of the ordinary cleaning
+  path. Activating them requires a separate approved change.
 - ClearURLs provider exceptions retain their current URL-wide behavior inside
   the ClearURLs adapter unless dedicated compatibility tests approve a change.
-- The public `Ruleset` facade remains. A `RulesetBuilder` owns merging,
+- The public `Ruleset` facade is retained. A `RulesetBuilder` owns merging,
   disabling, deduplication, and final compilation. Public compiled-store
   `merge`/`disable` behavior is either migrated/deprecated or backed by compact
   canonical definitions; compiled indexes are never concatenated.
@@ -156,7 +155,8 @@ blocked by external infrastructure.
 8. Sender clones share the compiled store by `Arc::ptr_eq`; concurrent matching
    is lock-free from the runtime’s perspective.
 9. CI runs fmt, Clippy, all-feature/no-default-feature tests on Rust 1.75 and
-   stable, then `nix flake check`; deterministic rule statistics are checked.
+   stable, then `nix flake check`. Use `rule-stats` for manual and benchmark
+   diagnostics.
 10. The final branch is committed and pushed, with the exact SHA and unresolved
     CI/deploy state reported separately.
 
@@ -546,8 +546,9 @@ and query secrets from source identifiers, and retain only capped samples of
 unsupported or failed patterns.
 
 Add a rule-stats or check-rule-pack CLI command with optional JSON output.
-Deterministic final statistics are a CI artifact; noisy timing measurements are
-published diagnostics rather than brittle hard gates.
+The command provides deterministic final statistics for manual and benchmark
+diagnostics. Noisy timing measurements are published diagnostics rather than
+brittle hard gates.
 
 ## Phase exit criteria
 
@@ -600,7 +601,7 @@ published diagnostics rather than brittle hard gates.
 - Release RSS and compiled-store memory are measured against the explicit
   targets.
 - README, config example, CLI help, module documentation, and Nix module
-  describe the new sources, limits, purpose hints, and diagnostics.
+  describe the supported sources, limits, purpose hints, and diagnostics.
 - External licenses are named as LGPL-3.0, MPL-2.0, and GPL-3.0.
 - Only original project data remains in builtin.json.
 
@@ -615,7 +616,7 @@ targets for the five recommended packs:
   measured regression is specifically justified.
 
 CI must run format, Clippy, all-feature tests, no-default-feature tests, and
-build checks on Rust 1.75 and stable, followed by nix flake check. Deterministic
-rule statistics are checked in CI. Microbenchmark timing is published with
-the pack set, build mode, machine, and measurement tool, not used as a noisy
-hard gate.
+build checks on Rust 1.75 and stable, followed by nix flake check. Use the
+`rule-stats` command for manual and benchmark diagnostics. Microbenchmark
+timing is published with the pack set, build mode, machine, and measurement
+tool, not used as a noisy hard gate.

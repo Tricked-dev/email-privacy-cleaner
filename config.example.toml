@@ -154,10 +154,10 @@ disabled_providers = [
 # on top — including the upstream ClearURLs data.min.json — to extend coverage
 # without code changes. Loaded packs AUGMENT the built-ins (union of providers).
 #
-# The legacy string arrays below remain supported and mean ClearURLs JSON.
+# The string arrays below are supported and mean ClearURLs JSON.
 # Structured entries use `source`; `path` and `url` are accepted aliases.
 # `format` is optional and accepts `auto`, `clear-urls`, `brave-clean-urls`,
-# `brave-debounce`, or `adguard`. `usage` is optional and currently accepts
+# `brave-debounce`, or `adguard`. `usage` is optional and accepts
 # only `mail-beacon`. The upstream data licences are ClearURLs Rules LGPL-3.0,
 # Brave lists MPL-2.0, and the AdGuard corpus GPL-3.0.
 #
@@ -194,7 +194,7 @@ rule_pack_urls = [
 #format = "adguard"
 #usage = "mail-beacon"  # permits modifierless AdGuard image rules
 
-# Resource bounds for structured and legacy external sources. Defaults:
+# Resource bounds for structured and string-array external sources. Defaults:
 # 5 MiB per source, 25 MiB total, 32 sources, 50,000 external rules,
 # 10,000 regex rules, and 16 retained diagnostic samples per source.
 #[rule_limits]

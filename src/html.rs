@@ -18,7 +18,7 @@ use crate::redirect::unwrap_redirect_url;
 
 /// Per-message context for HTML cleaning that isn't part of the static config.
 ///
-/// Currently carries the set of "sensitive" links (e.g. `List-Unsubscribe`
+/// Carries the set of "sensitive" links (e.g. `List-Unsubscribe`
 /// targets) whose `href` must be left untouched so recipient-specific tokens
 /// survive.
 #[derive(Debug, Clone, Default)]

@@ -55,8 +55,8 @@ pub enum RulePackUsage {
     MailBeacon,
 }
 
-/// A structured source entry.  The legacy `rule_packs` and `rule_pack_urls`
-/// string arrays remain supported; this form supplies a format/purpose hint.
+/// A structured source entry. The `rule_packs` and `rule_pack_urls` string
+/// arrays are also supported; this form supplies a format/purpose hint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RulePackSource {
     /// Local path or HTTPS URL.
@@ -214,13 +214,13 @@ pub enum ParamSubject {
 pub enum DecodeMode {
     Direct,
     Base64Url,
-    /// Compatibility mode for existing ClearURLs rules.
+    /// Decode mode used by existing ClearURLs rules.
     ExistingAutoDecode,
 }
 
 /// Origin of a compiled redirect extractor.
 ///
-/// `Legacy` covers the existing ClearURLs and built-in redirect behavior.
+/// `Legacy` covers ClearURLs and built-in redirect behavior.
 /// `Brave` is marked separately so Brave-specific safety checks cannot change
 /// legacy redirect behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -578,6 +578,9 @@ struct ParamAction {
     referral: bool,
     exception: bool,
     exception_all: bool,
+    legacy_builtin_global_carveout: bool,
+    clearurls_provider_ids: Box<[usize]>,
+    matcher_spec: ParamMatcherSpec,
     matcher: CompiledParamMatcher,
 }
 
@@ -645,9 +648,9 @@ struct RuleStore {
 #[derive(Debug)]
 pub struct Ruleset {
     store: Arc<RuleStore>,
-    /// Compact canonical definitions retained for the legacy `merge` and
-    /// `disable` methods.  New callers should use [`RulesetBuilder`] and call
-    /// `finish` once; the builder's temporary maps are not retained.
+    /// Compact canonical definitions retained for the compatibility `merge`
+    /// and `disable` methods. Callers that load many sources should use
+    /// [`RulesetBuilder`] and call `finish` once; builder maps are released.
     canonical: Arc<[SourceIr]>,
     disabled_providers: Arc<[String]>,
     report: RuleLoadReport,
@@ -657,7 +660,7 @@ pub struct Ruleset {
 
 impl Default for Ruleset {
     fn default() -> Self {
-        Self::builtin()
+        Self::empty()
     }
 }
 
@@ -866,6 +869,14 @@ impl RulesetBuilder {
 }
 
 impl Ruleset {
+    /// Construct an empty ruleset.
+    ///
+    /// This is the empty default expected by the public ruleset API. Call
+    /// [`Ruleset::builtin`] when the built-in rules are explicitly desired.
+    pub fn empty() -> Ruleset {
+        RulesetBuilder::new(RuleLoadLimits::default()).finish()
+    }
+
     /// The built-in ClearURLs-format rule pack.
     pub fn builtin() -> Ruleset {
         let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
@@ -907,7 +918,7 @@ impl Ruleset {
     }
 
     /// Merge another ruleset through canonical definitions and rebuild all
-    /// indexes.  This legacy API is intentionally slower than using one
+    /// indexes. This compatibility API is slower than using one
     /// [`RulesetBuilder`] and should not be used at startup for many sources.
     pub fn merge(&mut self, other: Ruleset) {
         let mut sources = self.canonical.to_vec();
@@ -1026,7 +1037,7 @@ impl Ruleset {
         )
     }
 
-    /// Compatibility API accepting a decoded parameter name.  New query
+    /// Compatibility API accepting a decoded parameter name. Query
     /// cleaners should call [`Ruleset::context_for`] with the raw segment so
     /// Brave's raw-key semantics survive.
     pub fn param_is_tracking(
@@ -1160,11 +1171,20 @@ impl Ruleset {
                 ) {
                     return true;
                 }
+                // A parsed URL that did not satisfy the target scope is an
+                // ordinary direct URL, not an encoded proxy payload.  Do not
+                // let a broad raw fallback (for example `*`) turn a scoped
+                // image rule into a global beacon rule.
+                if !contains_embedded_url(url) {
+                    return false;
+                }
             }
             let Some(raw_regex) = &rule.raw_regex else {
                 return false;
             };
-            raw_regex.is_match(url) || host.map(|host| raw_regex.is_match(host)).unwrap_or(false)
+            raw_regex.is_match(url)
+                || host.map(|host| raw_regex.is_match(host)).unwrap_or(false)
+                || (contains_embedded_url(url) && regex_matches_embedded_url(raw_regex, url))
         })
     }
 }
@@ -1214,14 +1234,32 @@ impl UrlContext<'_> {
             if !action.matcher.matches(segment, &self.store.regex_chunks) {
                 continue;
             }
-            // ClearURLs exceptions are historically URL-wide within the
-            // ClearURLs parameter namespace.  Keep that compatibility rule
-            // while leaving actions imported from other formats independent.
-            if action.source == SourceKind::ClearUrls && self.has_clearurls_exception() {
+            // ClearURLs exceptions are URL-wide within the matching provider.
+            // A semantically deduplicated action may have
+            // several active provider contributors, so the carve-out applies
+            // only when every contributor is currently exceptional.
+            if action.source == SourceKind::ClearUrls
+                && action.legacy_builtin_global_carveout
+                && self.has_clearurls_exception()
+            {
+                continue;
+            }
+            if action.source == SourceKind::ClearUrls
+                && !action.clearurls_provider_ids.is_empty()
+                && action
+                    .clearurls_provider_ids
+                    .iter()
+                    .all(|provider_id| self.clearurls_exceptions.contains(provider_id))
+            {
                 continue;
             }
             if action.source == SourceKind::AdGuard
-                && self.has_matching_adguard_exception(segment, include_vendor, include_referral)
+                && self.has_matching_adguard_exception(
+                    action,
+                    segment,
+                    include_vendor,
+                    include_referral,
+                )
             {
                 continue;
             }
@@ -1232,6 +1270,7 @@ impl UrlContext<'_> {
 
     fn has_matching_adguard_exception(
         &self,
+        positive: &ParamAction,
         segment: &str,
         include_vendor: bool,
         include_referral: bool,
@@ -1242,7 +1281,8 @@ impl UrlContext<'_> {
                 && action.exception
                 && action_enabled(action, self, include_vendor, include_referral)
                 && (action.exception_all
-                    || action.matcher.matches(segment, &self.store.regex_chunks))
+                    || (action.matcher_spec == positive.matcher_spec
+                        && action.matcher.matches(segment, &self.store.regex_chunks)))
         })
     }
 }
@@ -1323,6 +1363,7 @@ fn compile_store(
     };
 
     let mut providers = Vec::<Provider>::new();
+    let mut provider_ids = HashMap::<String, usize>::new();
     for source in sources {
         for provider in &source.providers {
             if disabled.contains(&provider.name.to_ascii_lowercase()) {
@@ -1337,6 +1378,7 @@ fn compile_store(
                 .iter()
                 .filter_map(|pattern| compile_url_pattern(pattern))
                 .collect::<Vec<_>>();
+            let provider_id = providers.len();
             providers.push(Provider {
                 name: provider.name.to_string(),
                 global: provider.global,
@@ -1344,12 +1386,16 @@ fn compile_store(
                 url_pattern,
                 exceptions,
             });
+            provider_ids.insert(
+                clearurls_provider_identity(&source.source, &provider.name),
+                provider_id,
+            );
         }
     }
 
     let mut pending = Vec::<PendingParamAction>::new();
     let mut parameter_order = 0u32;
-    let mut seen = HashSet::<ParamDedupKey>::new();
+    let mut seen = HashMap::<ParamDedupKey, usize>::new();
     let mut duplicates = HashMap::<usize, usize>::new();
     for source in sources {
         for rule in &source.params {
@@ -1361,16 +1407,45 @@ fn compile_store(
             {
                 continue;
             }
+            let clearurls_provider_ids = if rule.source == SourceKind::ClearUrls {
+                let Some(provider) = rule.provider.as_deref() else {
+                    skipped += 1;
+                    continue;
+                };
+                let Some(provider_id) = provider_ids
+                    .get(&clearurls_provider_identity(&source.source, provider))
+                    .copied()
+                else {
+                    // A positive rule cannot remain active when its provider
+                    // scope failed to compile.  This also prevents a failed
+                    // provider from contributing an incomplete exception
+                    // membership to a deduplicated action.
+                    skipped += 1;
+                    continue;
+                };
+                vec![provider_id]
+            } else {
+                Vec::new()
+            };
+            let legacy_builtin_global_carveout =
+                rule.source == SourceKind::ClearUrls && rule.global && source.source == "builtin";
             let key = ParamDedupKey {
                 global: rule.global,
                 referral: rule.referral,
                 exception: rule.exception,
                 exception_all: rule.exception_all,
+                legacy_builtin_global_carveout,
                 matcher: rule.matcher.clone(),
                 include: rule.include.clone(),
                 exclude: rule.exclude.clone(),
             };
-            if !seen.insert(key) {
+            if let Some(existing_index) = seen.get(&key).copied() {
+                let existing = &mut pending[existing_index];
+                for provider_id in clearurls_provider_ids {
+                    if !existing.clearurls_provider_ids.contains(&provider_id) {
+                        existing.clearurls_provider_ids.push(provider_id);
+                    }
+                }
                 *duplicates.entry(rule.report_index).or_default() += 1;
                 continue;
             }
@@ -1382,12 +1457,16 @@ fn compile_store(
                 skipped += 1;
                 continue;
             };
+            let pending_index = pending.len();
+            seen.insert(key, pending_index);
             pending.push(PendingParamAction {
                 source: rule.source,
                 global: rule.global,
                 referral: rule.referral,
                 exception: rule.exception,
                 exception_all: rule.exception_all,
+                legacy_builtin_global_carveout,
+                clearurls_provider_ids,
                 matcher: rule.matcher.clone(),
                 include,
                 exclude,
@@ -1420,6 +1499,9 @@ fn compile_store(
             referral: item.referral,
             exception: item.exception,
             exception_all: item.exception_all,
+            legacy_builtin_global_carveout: item.legacy_builtin_global_carveout,
+            clearurls_provider_ids: item.clearurls_provider_ids.into_boxed_slice(),
+            matcher_spec: item.matcher.clone(),
             matcher,
         });
         groups.push(RuleGroup {
@@ -1557,6 +1639,10 @@ fn compile_store(
     )
 }
 
+fn clearurls_provider_identity(source: &str, provider: &str) -> String {
+    format!("{source}\u{1f}{provider}")
+}
+
 #[derive(Debug, Clone)]
 struct PendingParamAction {
     source: SourceKind,
@@ -1564,6 +1650,8 @@ struct PendingParamAction {
     referral: bool,
     exception: bool,
     exception_all: bool,
+    legacy_builtin_global_carveout: bool,
+    clearurls_provider_ids: Vec<usize>,
     matcher: ParamMatcherSpec,
     include: Box<[ScopeId]>,
     exclude: Box<[ScopeId]>,
@@ -1576,6 +1664,7 @@ struct ParamDedupKey {
     referral: bool,
     exception: bool,
     exception_all: bool,
+    legacy_builtin_global_carveout: bool,
     matcher: ParamMatcherSpec,
     include: Vec<ScopeSpec>,
     exclude: Vec<ScopeSpec>,
@@ -1957,6 +2046,35 @@ fn split_query_segment(segment: &str) -> (&str, bool, &str) {
     }
 }
 
+fn contains_embedded_url(raw_url: &str) -> bool {
+    let lower = raw_url.to_ascii_lowercase();
+    lower.contains("%3a%2f%2f")
+        || lower
+            .find("://")
+            .is_some_and(|offset| lower[offset + 3..].contains("://"))
+}
+
+fn regex_matches_embedded_url(regex: &Regex, raw_url: &str) -> bool {
+    let decoded = decode_query_component(raw_url);
+    let lower = decoded.to_ascii_lowercase();
+    let mut offset = 0;
+    while offset < lower.len() {
+        let relative = ["https://", "http://"]
+            .iter()
+            .filter_map(|marker| lower[offset..].find(marker))
+            .min();
+        let Some(relative) = relative else {
+            break;
+        };
+        let start = offset + relative;
+        if regex.is_match(&decoded[start..]) {
+            return true;
+        }
+        offset = start.saturating_add(1);
+    }
+    false
+}
+
 fn decode_query_component(value: &str) -> String {
     percent_decode_str(&value.replace('+', " "))
         .decode_utf8_lossy()
@@ -1988,14 +2106,14 @@ fn glob_to_regex(pattern: &str) -> String {
 fn extract_glob_host_suffix(pattern: &str) -> Option<Box<str>> {
     let after_scheme = pattern.split_once("://")?.1;
     let host = after_scheme.split(['/', '?', '#']).next()?;
-    if host.is_empty() || host.contains('*') || host.contains('?') {
+    if host.is_empty() || host.contains('?') {
         return None;
     }
-    Some(
-        host.trim_start_matches("*.")
-            .to_ascii_lowercase()
-            .into_boxed_str(),
-    )
+    let host = host.strip_prefix("*.").unwrap_or(host);
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+    Some(host.to_ascii_lowercase().into_boxed_str())
 }
 
 fn adguard_target_regex(pattern: &str, match_case: bool) -> String {
@@ -2165,19 +2283,18 @@ fn parse_clearurls(
             ir.failed_regexes += 1;
             continue;
         }
-        let exceptions = provider
-            .exceptions
-            .iter()
-            .filter(|pattern| {
-                let allowed = regex_pattern_allowed(&format!("(?i){pattern}"));
-                if !allowed {
-                    counters.failed(format!("{name}.exceptions:{pattern}"));
-                    ir.failed_regexes += 1;
-                }
-                allowed
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut exceptions = Vec::with_capacity(provider.exceptions.len());
+        for pattern in &provider.exceptions {
+            let compiled = format!("(?i){pattern}");
+            if !regex_pattern_allowed(&compiled) || Regex::new(&compiled).is_err() {
+                counters.failed(format!("{name}.exceptions:{pattern}"));
+                ir.failed_regexes += 1;
+                return Err(CleanerError::Config(format!(
+                    "ClearURLs provider {name} has an invalid exception regex"
+                )));
+            }
+            exceptions.push(pattern.clone());
+        }
         let provider_ir = ProviderIr {
             name: name.clone().into_boxed_str(),
             global: name == "globalRules",
@@ -2252,11 +2369,8 @@ fn parse_clearurls(
             ir.accepted_rules += 1;
         }
         if provider.complete_provider {
-            ir.beacons.push(BeaconRuleIr {
-                include: include.clone(),
-                exclude: Vec::new(),
-                raw_pattern: Some(provider.url_pattern.clone().into_boxed_str()),
-            });
+            // The compiled provider pass below retains the single beacon
+            // action.  Count it here without adding a second IR beacon.
             ir.accepted_rules += 1;
         }
     }
@@ -2573,12 +2687,24 @@ fn parse_adguard(
             counters.unsupported(format!("{reason}: {line}"));
             continue;
         }
+        if image && removeparam.is_some() {
+            // The runtime has separate APIs for parameter removal and image
+            // beacon matching.  Applying this mixed rule as a parameter rule
+            // would incorrectly clean ordinary anchors, while treating it as
+            // a beacon would lose its removeparam action.  Skip it until a
+            // context-aware action model can preserve both constraints.
+            ir.unsupported_rules += 1;
+            counters.unsupported(format!(
+                "mixed removeparam/image action is unsupported: {line}"
+            ));
+            continue;
+        }
         if !target.is_empty() && !regex_pattern_allowed(target) {
             ir.failed_regexes += 1;
             counters.failed(format!("AdGuard target exceeds byte limit: {line}"));
             continue;
         }
-        let scope = if target.is_empty() {
+        let scope = if target.is_empty() && domains.is_empty() {
             ScopeSpec::Any
         } else {
             ScopeSpec::AdGuardTarget {
@@ -2587,6 +2713,12 @@ fn parse_adguard(
                 match_case,
             }
         };
+        if inverted && removeparam.is_none() && (image || usage == Some(RulePackUsage::MailBeacon))
+        {
+            ir.unsupported_rules += 1;
+            counters.unsupported(format!("inverted image/beacon rule: {line}"));
+            continue;
+        }
         match removeparam {
             Some(Some(value)) if value.starts_with('~') => {
                 ir.unsupported_rules += 1;
@@ -2864,47 +2996,88 @@ fn expand_hir(hir: &Hir, cap: usize) -> Option<Vec<String>> {
 }
 
 fn count_regex_rules(source: &SourceIr) -> usize {
-    let mut count = 0;
-    let count_scopes = |scopes: &[ScopeSpec]| {
-        scopes
-            .iter()
-            .filter(|scope| !matches!(scope, ScopeSpec::Any))
-            .count()
-    };
+    let mut expressions = HashSet::<String>::new();
 
     for provider in &source.providers {
-        count += 1;
-        count += provider.exceptions.len();
+        add_regex_budget_expression(
+            &mut expressions,
+            "url-pattern",
+            &format_regex_for_scope(provider.url_pattern.as_ref()),
+        );
+        for exception in &provider.exceptions {
+            add_regex_budget_expression(
+                &mut expressions,
+                "url-exception",
+                &format_regex_for_scope(exception),
+            );
+        }
     }
     for rule in &source.params {
         if matches!(rule.matcher, ParamMatcherSpec::Regex { .. }) {
-            count += 1;
+            if let ParamMatcherSpec::Regex {
+                pattern,
+                subject,
+                case_sensitive,
+                requires_equals,
+            } = &rule.matcher
+            {
+                add_regex_budget_expression(
+                    &mut expressions,
+                    "parameter",
+                    &format!("{subject:?}:{case_sensitive}:{requires_equals}:{pattern}"),
+                );
+            }
         }
-        count += count_scopes(&rule.include);
-        count += count_scopes(&rule.exclude);
+        for scope in rule.include.iter().chain(rule.exclude.iter()) {
+            add_regex_budget_scope(&mut expressions, scope);
+        }
     }
     for rule in &source.redirects {
-        count += count_scopes(&rule.include);
-        count += count_scopes(&rule.exclude);
+        for scope in rule.include.iter().chain(rule.exclude.iter()) {
+            add_regex_budget_scope(&mut expressions, scope);
+        }
         if matches!(
             rule.extractor,
             RedirectExtractorIr::ClearUrls { .. } | RedirectExtractorIr::PathRegex { .. }
         ) {
-            count += 1;
+            match &rule.extractor {
+                RedirectExtractorIr::ClearUrls { pattern }
+                | RedirectExtractorIr::PathRegex { pattern, .. } => {
+                    add_regex_budget_expression(&mut expressions, "redirect", pattern);
+                }
+                RedirectExtractorIr::QueryParam { .. } => unreachable!(),
+            }
         }
     }
     for rule in &source.beacons {
-        count += count_scopes(&rule.include);
-        count += count_scopes(&rule.exclude);
+        for scope in rule.include.iter().chain(rule.exclude.iter()) {
+            add_regex_budget_scope(&mut expressions, scope);
+        }
         if rule.raw_pattern.is_some() {
-            count += 1;
+            add_regex_budget_expression(
+                &mut expressions,
+                "beacon",
+                rule.raw_pattern.as_deref().unwrap_or_default(),
+            );
         }
     }
     for rule in &source.raw_rules {
-        count += count_scopes(&rule.include);
-        count += 1;
+        for scope in &rule.include {
+            add_regex_budget_scope(&mut expressions, scope);
+        }
+        add_regex_budget_expression(&mut expressions, "raw", &rule.pattern);
     }
-    count
+    expressions.len()
+}
+
+fn add_regex_budget_scope(expressions: &mut HashSet<String>, scope: &ScopeSpec) {
+    if !matches!(scope, ScopeSpec::Any) {
+        expressions.insert(format!("scope:{scope:?}"));
+    }
+}
+
+fn add_regex_budget_expression(expressions: &mut HashSet<String>, kind: &str, pattern: &str) {
+    expressions.insert(format!("{kind}:{pattern}"));
 }
 
 #[cfg(test)]

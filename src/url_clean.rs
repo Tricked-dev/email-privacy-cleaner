@@ -14,8 +14,8 @@
 //! These format-specific rules are evaluated alongside the user's global
 //! tracking-parameter list. A source's exception only affects the compatible
 //! action and scope; it does not suppress unrelated rules from another format.
-//! The legacy [`Ruleset::param_is_tracking`](crate::ruleset::Ruleset::param_is_tracking)
-//! helper accepts a bare name for compatibility, but this cleaner always
+//! The compatibility [`Ruleset::param_is_tracking`](crate::ruleset::Ruleset::param_is_tracking)
+//! helper accepts a bare name, but this cleaner always
 //! passes the original query segment so a Brave no-value segment is preserved.
 
 use percent_encoding::percent_decode_str;

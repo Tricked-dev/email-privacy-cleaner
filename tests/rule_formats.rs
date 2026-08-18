@@ -4,7 +4,10 @@ use email_privacy_cleaner::ruleset::{
     RedirectOrigin, RuleLoadLimits, RulePackFormat, Ruleset, RulesetBuilder,
 };
 use email_privacy_cleaner::validate::RejectReason;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use url::Url;
+
+static NEXT_PACK_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn removes(ruleset: &Ruleset, url: &str, segment: &str) -> bool {
     ruleset.should_remove_parameter(url, segment, true, true)
@@ -390,6 +393,156 @@ fn adguard_scope_and_exception_are_action_scoped() {
 }
 
 #[test]
+fn adguard_empty_target_preserves_domain_scope_for_parameters_exceptions_and_images() {
+    let ruleset = Ruleset::from_adguard_str(
+        "*$removeparam=utm_source,domain=one.example\n\
+         *$removeparam=campaign\n\
+         @@*$removeparam=campaign,domain=one.example\n\
+         *$image,domain=one.example\n",
+    )
+    .unwrap();
+
+    assert!(removes(
+        &ruleset,
+        "https://one.example/path?utm_source=x",
+        "utm_source=x"
+    ));
+    assert!(!removes(
+        &ruleset,
+        "https://two.example/path?utm_source=x",
+        "utm_source=x"
+    ));
+    assert!(!removes(
+        &ruleset,
+        "https://one.example/path?campaign=x",
+        "campaign=x"
+    ));
+    assert!(removes(
+        &ruleset,
+        "https://two.example/path?campaign=x",
+        "campaign=x"
+    ));
+    assert!(ruleset.is_beacon_url("https://one.example/pixel", Some("one.example")));
+    assert!(!ruleset.is_beacon_url("https://two.example/pixel", Some("two.example")));
+}
+
+#[test]
+fn adguard_image_exceptions_are_skipped_instead_of_blocking() {
+    let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+    builder
+        .add_source_str(
+            "image-exceptions",
+            "@@||tracker.example^$image\n@@||mail.example^\n",
+            Some(RulePackFormat::AdGuard),
+            Some(email_privacy_cleaner::ruleset::RulePackUsage::MailBeacon),
+        )
+        .unwrap();
+    let ruleset = builder.finish();
+
+    assert!(!ruleset.is_beacon_url("https://tracker.example/pixel", None));
+    assert!(!ruleset.is_beacon_url("https://mail.example/pixel", None));
+    let report = ruleset
+        .load_report()
+        .sources
+        .iter()
+        .find(|source| source.source == "image-exceptions")
+        .unwrap();
+    assert_eq!(report.accepted_rules, 0);
+    assert_eq!(report.unsupported_rules, 2);
+}
+
+#[test]
+fn adguard_mixed_removeparam_image_does_not_clean_anchor_urls() {
+    let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+    builder
+        .add_source_str(
+            "mixed-image-removeparam",
+            "||example.com^$removeparam=utm_source,image\n",
+            Some(RulePackFormat::AdGuard),
+            None,
+        )
+        .unwrap();
+    let ruleset = builder.finish();
+
+    // A mixed action/content rule cannot be limited to image/CSS contexts by
+    // the parameter-cleaning API, so it must never affect ordinary anchors.
+    assert!(!removes(
+        &ruleset,
+        "https://example.com/article?utm_source=newsletter",
+        "utm_source=newsletter"
+    ));
+    assert!(!ruleset.is_beacon_url("https://example.com/pixel", None));
+
+    let report = ruleset
+        .load_report()
+        .sources
+        .iter()
+        .find(|source| source.source == "mixed-image-removeparam")
+        .unwrap();
+    assert_eq!(report.accepted_rules, 0);
+    assert_eq!(report.unsupported_rules, 1);
+}
+
+#[test]
+fn adguard_exact_and_regex_exceptions_only_negate_the_same_matcher_kind() {
+    let exact_positive_regex_exception = Ruleset::from_adguard_str(
+        "||example.com^$removeparam=utm_source\n@@||example.com^$removeparam=/^utm_source=.*$/\n",
+    )
+    .unwrap();
+    let regex_positive_exact_exception = Ruleset::from_adguard_str(
+        "||example.com^$removeparam=/^utm_source=.*$/\n@@||example.com^$removeparam=utm_source\n",
+    )
+    .unwrap();
+    let regex_positive_regex_exception = Ruleset::from_adguard_str(
+        "||example.com^$removeparam=/^utm_source=.*$/\n@@||example.com^$removeparam=/^utm_source=.*$/\n",
+    )
+    .unwrap();
+
+    let url = "https://example.com/path?utm_source=x";
+    assert!(removes(
+        &exact_positive_regex_exception,
+        url,
+        "utm_source=x"
+    ));
+    assert!(removes(
+        &regex_positive_exact_exception,
+        url,
+        "utm_source=x"
+    ));
+    assert!(!removes(
+        &regex_positive_regex_exception,
+        url,
+        "utm_source=x"
+    ));
+}
+
+#[test]
+fn malformed_clearurls_exception_rejects_the_whole_source() {
+    let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+    assert!(builder
+        .add_source_str(
+            "malformed-clearurls",
+            r#"{"providers":{"provider":{"urlPattern":"^https://example\\.com","rules":["utm_source"],"exceptions":["["]}}}"#,
+            Some(RulePackFormat::ClearUrls),
+            None,
+        )
+        .is_err());
+    let ruleset = builder.finish();
+
+    assert_eq!(ruleset.stats().groups, 0);
+    let report = ruleset
+        .load_report()
+        .sources
+        .iter()
+        .find(|source| source.source == "malformed-clearurls")
+        .unwrap();
+    assert_eq!(
+        report.skipped_reason,
+        Some(email_privacy_cleaner::ruleset::SkipReason::Parse)
+    );
+}
+
+#[test]
 fn adguard_multi_domain_scope_is_indexed_for_every_domain() {
     let ruleset =
         Ruleset::from_adguard_str("*$removeparam=utm_source,domain=one.example|two.example\n")
@@ -442,6 +595,40 @@ fn beacon_domain_anchor_is_not_an_arbitrary_substring_match() {
 }
 
 #[test]
+fn wildcard_brave_host_is_suffix_indexed_without_false_candidates() {
+    let ruleset = Ruleset::from_brave_clean_urls_str(
+        r#"[{"include":["*://*.example.com/*"],"exclude":[],"params":["tracking"]}]"#,
+    )
+    .unwrap();
+
+    let matching_url = Url::parse("https://mail.example.com/path?tracking=1").unwrap();
+    let matching_context = ruleset.context_for(matching_url.as_str(), &matching_url);
+    assert_eq!(matching_context.candidate_group_count(), 1);
+    assert!(removes(&ruleset, matching_url.as_str(), "tracking=1"));
+
+    let unrelated_url = Url::parse("https://unrelated.test/path?tracking=1").unwrap();
+    let unrelated_context = ruleset.context_for(unrelated_url.as_str(), &unrelated_url);
+    assert_eq!(unrelated_context.candidate_group_count(), 0);
+    assert!(!removes(&ruleset, unrelated_url.as_str(), "tracking=1"));
+    assert_eq!(ruleset.stats().domain_index_keys, 1);
+}
+
+#[test]
+fn complete_provider_is_one_beacon_and_matches_encoded_proxy_source() {
+    let ruleset = Ruleset::from_clearurls_str(
+        r#"{"providers":{"pixel":{"urlPattern":"^https?://(?:[a-z0-9-]+\\.)*pixel\\.example","completeProvider":true}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(ruleset.stats().beacon_rules, 1);
+    assert!(ruleset.is_beacon_url("https://pixel.example/pixel", None));
+    assert!(ruleset.is_beacon_url(
+        "https://proxy.example/pixel?url=https%3A%2F%2Fpixel.example%2Fpixel",
+        Some("proxy.example")
+    ));
+}
+
+#[test]
 fn clearurls_exception_does_not_suppress_other_format_actions() {
     let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
     builder
@@ -471,10 +658,69 @@ fn clearurls_exception_does_not_suppress_other_format_actions() {
     let ruleset = builder.finish();
     let url = "https://example.com/path?utm_source=x&provider_id=x&brave_id=x&adguard_id=x&keep=1";
 
-    assert!(!removes(&ruleset, url, "utm_source=x"));
+    assert!(removes(&ruleset, url, "utm_source=x"));
     assert!(!removes(&ruleset, url, "provider_id=x"));
     assert!(removes(&ruleset, url, "brave_id=x"));
     assert!(removes(&ruleset, url, "adguard_id=x"));
+}
+
+#[test]
+fn clearurls_exceptions_preserve_shared_actions_from_other_providers() {
+    let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+    builder
+        .add_source_str(
+            "clearurls-one",
+            r#"{"providers":{"one":{"urlPattern":"^https://example\\.com","rules":["shared","one_only"],"exceptions":["keep-one"]}}}"#,
+            Some(RulePackFormat::ClearUrls),
+            None,
+        )
+        .unwrap();
+    builder
+        .add_source_str(
+            "clearurls-two",
+            r#"{"providers":{"two":{"urlPattern":"^https://example\\.com","rules":["shared","two_only"],"exceptions":["keep-two"]}}}"#,
+            Some(RulePackFormat::ClearUrls),
+            None,
+        )
+        .unwrap();
+    let ruleset = builder.finish();
+
+    let keep_one = "https://example.com/path?keep-one=1";
+    assert!(removes(&ruleset, keep_one, "shared=x"));
+    assert!(!removes(&ruleset, keep_one, "one_only=x"));
+    assert!(removes(&ruleset, keep_one, "two_only=x"));
+
+    let keep_both = "https://example.com/path?keep-one=1&keep-two=1";
+    assert!(!removes(&ruleset, keep_both, "shared=x"));
+}
+
+#[test]
+fn disabled_clearurls_provider_is_removed_before_shared_action_exception_scope() {
+    let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+    builder
+        .add_source_str(
+            "clearurls-disabled",
+            r#"{"providers":{"disabled":{"urlPattern":"^https://example\\.com","rules":["shared"],"exceptions":["keep"]}}}"#,
+            Some(RulePackFormat::ClearUrls),
+            None,
+        )
+        .unwrap();
+    builder
+        .add_source_str(
+            "clearurls-enabled",
+            r#"{"providers":{"enabled":{"urlPattern":"^https://example\\.com","rules":["shared"]}}}"#,
+            Some(RulePackFormat::ClearUrls),
+            None,
+        )
+        .unwrap();
+    builder.disable_providers(&["disabled".into()]);
+    let ruleset = builder.finish();
+
+    assert!(removes(
+        &ruleset,
+        "https://example.com/path?keep=1",
+        "shared=x"
+    ));
 }
 
 #[test]
@@ -549,7 +795,7 @@ fn redirect_targets_retain_source_origin() {
 }
 
 #[test]
-fn brave_cross_host_redirect_is_rejected_without_psl_guessing() {
+fn brave_non_registrable_cross_host_redirect_is_rejected() {
     let path = write_pack(
         r#"[{"include":["*://short.example/*"],"exclude":[],"action":"redirect","param":"url"}]"#,
     );
@@ -562,12 +808,89 @@ fn brave_cross_host_redirect_is_rejected_without_psl_guessing() {
     config.finalize();
     let _ = std::fs::remove_file(path);
 
+    let input = Url::parse("https://short.example/x?url=https%3A%2F%2Fcom%2Flanding").unwrap();
+    let result = unwrap_redirect_url(&input, &config);
+    assert!(!result.unwrapped);
+    assert_eq!(result.rejected, Some(RejectReason::BraveDestinationScope));
+}
+
+#[test]
+fn brave_documented_cross_site_template_unwraps() {
+    let path = write_pack(
+        r#"[{"include":["*://y2u.be/*"],"exclude":[],"action":"regex-path-template","param":"^/(.+)$","redirect_url_template":"https://www.youtube.com/watch?v=$1"}]"#,
+    );
+    let mut config = CleanerConfig::default();
+    config.rule_pack_sources = vec![RulePackSource {
+        source: path.clone(),
+        format: Some(RulePackFormat::BraveDebounce),
+        usage: None,
+    }];
+    config.finalize();
+    let _ = std::fs::remove_file(path);
+
+    let input = Url::parse("https://y2u.be/dQw4w9WgXcQ").unwrap();
+    let result = unwrap_redirect_url(&input, &config);
+    assert!(result.unwrapped);
+    assert_eq!(
+        result.url.as_str(),
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    );
+}
+
+#[test]
+fn brave_same_host_redirect_is_rejected() {
+    let path = write_pack(
+        r#"[{"include":["*://short.example.com/*"],"exclude":[],"action":"redirect","param":"url"}]"#,
+    );
+    let mut config = CleanerConfig::default();
+    config.rule_pack_sources = vec![RulePackSource {
+        source: path.clone(),
+        format: Some(RulePackFormat::BraveDebounce),
+        usage: None,
+    }];
+    config.finalize();
+    let _ = std::fs::remove_file(path);
+
     let input =
-        Url::parse("https://short.example/x?url=https%3A%2F%2Fdestination.example%2Flanding")
+        Url::parse("https://short.example.com/x?url=https%3A%2F%2Fshort.example.com%2Fdestination")
             .unwrap();
     let result = unwrap_redirect_url(&input, &config);
     assert!(!result.unwrapped);
     assert_eq!(result.rejected, Some(RejectReason::BraveDestinationScope));
+}
+
+#[test]
+fn brave_sibling_subdomain_redirect_is_rejected() {
+    let path = write_pack(
+        r#"[{"include":["*://click.example.com/*"],"exclude":[],"action":"redirect","param":"url"}]"#,
+    );
+    let mut config = CleanerConfig::default();
+    config.rule_pack_sources = vec![RulePackSource {
+        source: path.clone(),
+        format: Some(RulePackFormat::BraveDebounce),
+        usage: None,
+    }];
+    config.finalize();
+    let _ = std::fs::remove_file(path);
+
+    let input = Url::parse(
+        "https://click.example.com/x?url=https%3A%2F%2Flanding.example.com%2Fdestination",
+    )
+    .unwrap();
+    let result = unwrap_redirect_url(&input, &config);
+    assert!(!result.unwrapped);
+    assert_eq!(result.rejected, Some(RejectReason::BraveDestinationScope));
+}
+
+#[test]
+fn ruleset_default_remains_empty_for_public_api_compatibility() {
+    let ruleset = Ruleset::default();
+    assert_eq!(ruleset.stats(), &Default::default());
+    assert!(!removes(
+        &ruleset,
+        "https://example.com/path?utm_source=news",
+        "utm_source=news"
+    ));
 }
 
 #[test]
@@ -607,12 +930,13 @@ fn bare_param_api_remains_compatible_without_changing_cleaning() {
 
 fn write_pack(contents: &str) -> String {
     let path = std::env::temp_dir().join(format!(
-        "epc-rule-format-{}-{}.json",
+        "epc-rule-format-{}-{}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_PACK_ID.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&path, contents).unwrap();
     path.to_string_lossy().into_owned()

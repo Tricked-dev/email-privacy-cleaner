@@ -207,3 +207,34 @@ fn match_only_regex_sets_are_split_by_aggregate_pattern_bytes() {
     let ruleset = builder.finish();
     assert!(ruleset.stats().regex_set_chunks >= 2);
 }
+
+#[test]
+fn shared_scope_counts_once_against_regex_budget() {
+    let source = serde_json::json!([{
+        "include": ["*://example.com/*"],
+        "exclude": [],
+        "params": ["one", "two", "three", "four"]
+    }])
+    .to_string();
+    let mut builder = RulesetBuilder::new(limits_with(1));
+
+    builder
+        .add_source_str(
+            "shared-brave-scope",
+            &source,
+            Some(RulePackFormat::BraveCleanUrls),
+            None,
+        )
+        .unwrap();
+
+    let ruleset = builder.finish();
+    let source_report = ruleset
+        .load_report()
+        .sources
+        .iter()
+        .find(|report| report.source == "shared-brave-scope")
+        .unwrap();
+    assert_eq!(source_report.skipped_reason, None);
+    assert_eq!(ruleset.stats().scopes, 1);
+    assert_eq!(ruleset.stats().groups, 4);
+}

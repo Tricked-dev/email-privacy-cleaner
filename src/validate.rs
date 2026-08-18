@@ -22,8 +22,7 @@ pub enum RejectReason {
     MixedScript,
     /// Host is a literal private / loopback / link-local / metadata IP.
     PrivateIp,
-    /// A Brave-derived redirect crossed a host boundary that cannot be
-    /// classified safely without a public-suffix list.
+    /// A Brave-derived redirect targeted a non-registrable host or literal IP.
     BraveDestinationScope,
 }
 

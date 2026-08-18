@@ -4,8 +4,8 @@
 //! unwrapped when the *destination* is explicitly embedded in the URL (usually
 //! a query parameter), the destination decodes to a valid `http(s)` URL, and it
 //! passes [`validate_destination`](crate::validate::validate_destination).
-//! Brave-derived rules additionally use a conservative exact-host boundary;
-//! legacy ClearURLs and built-in rules retain the existing validator alone.
+//! Brave-derived rules additionally require a registrable destination host;
+//! ClearURLs and built-in rules use the existing validator alone.
 //!
 //! When unwrapping confidence is low (unknown provider, or no valid embedded
 //! destination) we keep the original URL but still strip known tracking query
@@ -14,6 +14,7 @@
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use percent_encoding::percent_decode_str;
+use psl::Psl;
 use url::Url;
 
 use crate::config::CleanerConfig;
@@ -127,11 +128,12 @@ pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapR
 
 /// Apply the additional safety boundary for Brave-derived redirects only.
 ///
-/// This project intentionally does not ship a public-suffix list, so it
-/// cannot determine an exact registrable domain for arbitrary hostnames.
-/// Accepting cross-host Brave rewrites would therefore require guessing about
-/// eTLD+1 boundaries. The conservative fallback is exact host equality;
-/// cross-host Brave candidates remain visible links and are not rewritten.
+/// Brave debounce rules intentionally support cross-site redirects, but never
+/// same-site redirects.  This mirrors Brave's `IsSameETLDForDebounce` guard:
+/// identical hosts and sibling subdomains under one registrable eTLD+1 are
+/// rejected, while a destination such as `y2u.be -> youtube.com` is allowed.
+/// The common destination validator still rejects unsafe schemes, userinfo,
+/// malformed or suspicious hosts, and private IPs.
 fn validate_origin_destination(
     origin: &RedirectOrigin,
     source: &Url,
@@ -141,13 +143,66 @@ fn validate_origin_destination(
         return Ok(());
     }
 
-    let source_host = source.host_str().ok_or(RejectReason::InvalidHost)?;
-    let candidate_host = candidate.host_str().ok_or(RejectReason::InvalidHost)?;
-    if source_host.eq_ignore_ascii_case(candidate_host) {
-        Ok(())
-    } else {
-        Err(RejectReason::BraveDestinationScope)
+    // Brave's URLPattern/GURL pipeline compares the hostname it extracts from
+    // the candidate URL with the parsed hostname before accepting a rewrite.
+    // Keep this conservative check even though `url::Url` has already parsed
+    // the candidate: it rejects ambiguous authority spellings instead of
+    // allowing the two parsers to disagree about the destination host.
+    let parsed_candidate_host = candidate.host_str().ok_or(RejectReason::InvalidHost)?;
+    let naive_candidate_host =
+        naive_hostname_from_url(candidate.as_str()).ok_or(RejectReason::BraveDestinationScope)?;
+    if naive_candidate_host != parsed_candidate_host {
+        return Err(RejectReason::BraveDestinationScope);
     }
+
+    let source_host = source.host_str().ok_or(RejectReason::InvalidHost)?;
+    let source_host = canonical_hostname(source_host);
+    let candidate_host = canonical_hostname(parsed_candidate_host);
+    if candidate_host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(RejectReason::BraveDestinationScope);
+    }
+
+    let candidate_domain = registrable_domain_without_private_suffix(candidate_host)
+        .ok_or(RejectReason::BraveDestinationScope)?;
+    let source_domain = registrable_domain_without_private_suffix(source_host);
+
+    if source_host.eq_ignore_ascii_case(candidate_host)
+        || source_domain.is_some_and(|domain| domain.eq_ignore_ascii_case(candidate_domain))
+    {
+        return Err(RejectReason::BraveDestinationScope);
+    }
+
+    Ok(())
+}
+
+/// Canonicalize the host spelling used for eTLD+1 comparisons.  URL hosts are
+/// case-insensitive and a trailing root dot does not identify another site.
+fn canonical_hostname(host: &str) -> &str {
+    host.trim_end_matches('.')
+}
+
+/// Return the registrable eTLD+1 while following Brave's exclusion of private
+/// registry suffixes from debounce same-site checks.
+fn registrable_domain_without_private_suffix(host: &str) -> Option<&str> {
+    let suffix = psl::List.suffix(host.as_bytes())?;
+    if suffix.typ() == Some(psl::Type::Private) {
+        return None;
+    }
+    let domain = psl::List.domain(host.as_bytes())?;
+    std::str::from_utf8(domain.as_bytes()).ok()
+}
+
+/// Reproduce Brave's deliberately simple hostname extraction check.  This is
+/// not a replacement URL parser; it is a mismatch detector for authority
+/// spellings that `Url` and the debounce rule's hostname parser interpret
+/// differently.
+fn naive_hostname_from_url(url: &str) -> Option<&str> {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    without_scheme
+        .split([':', '/', '?'])
+        .find(|part| !part.is_empty())
 }
 
 /// Decode a candidate destination value, peeling up to [`MAX_DECODE_DEPTH`]

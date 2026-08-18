@@ -1,9 +1,8 @@
 //! Characterization tests for the ruleset loading/finalization contract.
 //!
-//! These tests intentionally describe the refactor API from
-//! `RULESET_REFACTOR_PLAN.md`.  The loader, limits, and report assertions are
-//! expected to be compile-red until that API is introduced; the sender-store
-//! assertion exercises the currently public facade.
+//! These tests specify the loader, limits, reporting, and sender-store
+//! contracts in `RULESET_REFACTOR_PLAN.md`. They exercise the public facade
+//! and its immutable compiled store.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -105,8 +104,8 @@ fn compatibility_finalization_reuses_ruleset_without_reloading_sources() {
         .unwrap();
     let first = config.ruleset();
 
-    // `from_toml_str` already finalized the compatibility path. A later
-    // public finalization with unchanged inputs must reuse the compiled store
+    // `from_toml_str` finalized the compatibility path. A later public
+    // finalization with unchanged inputs must reuse the compiled store
     // instead of fetching configured sources again.
     config.finalize();
     let second = config.ruleset();
