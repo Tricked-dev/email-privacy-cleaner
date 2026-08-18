@@ -21,6 +21,10 @@
 //! * [`clean_html`] — sanitise a single HTML fragment/body.
 //! * [`clean_url`] — strip tracking query params from one URL.
 //! * [`unwrap_redirect_url`] — offline ESP redirect unwrapping for one URL.
+//! * [`RulePackSource`] and [`RuleLoadLimits`] — configure bounded,
+//!   multi-format rule-pack loading.
+//! * [`RuleStoreStats`] and [`RuleLoadReport`] — inspect the frozen indexed
+//!   store and bounded source diagnostics.
 
 pub mod config;
 pub mod encoding;
@@ -40,7 +44,10 @@ pub use error::{CleanerError, Result};
 pub use html::{clean_html, HtmlCleanResult};
 pub use mime::{clean_message, CleanStats, CleanerResult};
 pub use redirect::{unwrap_redirect_url, RedirectUnwrapResult};
-pub use ruleset::Ruleset;
+pub use ruleset::{
+    RedirectOrigin, RedirectTarget, RuleLoadLimits, RuleLoadReport, RulePackFormat, RulePackSource,
+    RulePackUsage, RuleStoreStats, Ruleset, SkipReason, SourceReport,
+};
 pub use url_clean::{clean_url, UrlCleanResult};
 pub use validate::RejectReason;
 

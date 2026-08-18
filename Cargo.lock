@@ -223,6 +223,7 @@ dependencies = [
  "percent-encoding",
  "quoted_printable",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "thiserror",

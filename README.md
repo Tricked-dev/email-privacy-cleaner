@@ -49,7 +49,7 @@ out entirely.
 ```
 email_privacy_cleaner          (library crate)
 ├── config        CleanerConfig (TOML), sender policies, rule-pack loading
-├── ruleset       ClearURLs-format rule engine (built-in + external packs)
+├── ruleset       indexed multi-format rule engine and bounded load reports
 ├── url_clean     clean_url()              — query-param + vendor stripping
 ├── redirect      unwrap_redirect_url()    — offline ESP unwrapping
 ├── validate      destination validation + SSRF IP blocking
@@ -60,7 +60,7 @@ email_privacy_cleaner          (library crate)
 └── milter        Sendmail/Postfix milter-protocol server
 
 binaries:
-  email-privacy-cleaner   CLI (clean / explain / diff / print-trackers)
+  email-privacy-cleaner   CLI (clean / explain / diff / print-trackers / rule-stats)
   email-privacy-milter    milter daemon
 ```
 
@@ -120,6 +120,24 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
+### Rule-engine baseline diagnostic
+
+The ignored integration test `tests/rule_engine_baseline.rs` provides a
+fixed-seed synthetic rule-pack and URL corpus for build, match, and message
+baselines. It uses only the standard library and existing crate APIs; the
+measurements are diagnostic and the assertions verify the corpus remained
+stable.
+
+Run it through the pinned Nix development environment:
+
+```bash
+nix develop -c cargo test --test rule_engine_baseline -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test prints `rule_engine_baseline build`, `match`, and `message` records
+with elapsed microseconds and a work count. It does not perform network I/O.
+
 ## CLI usage
 
 ```bash
@@ -137,6 +155,12 @@ email-privacy-cleaner explain-message --config config.toml < raw.eml
 
 # List the trackers detected in a message (params, ESP wrappers, pixels)
 email-privacy-cleaner print-trackers < raw.eml
+
+# Inspect compiled rule counts and bounded source diagnostics
+email-privacy-cleaner rule-stats --config config.toml
+
+# Emit the same rule statistics as machine-readable JSON
+email-privacy-cleaner rule-stats --config config.toml --json
 
 # Show a line diff between the original and cleaned message
 email-privacy-cleaner diff-message < raw.eml
@@ -244,8 +268,37 @@ default. Highlights:
 | `disabled_providers` | `[]` | rule-pack provider names to switch off |
 | `rule_packs` | `[]` | external ClearURLs-format pack files to merge |
 | `rule_pack_urls` | `[]` | pack URLs (`file://`/paths load offline; `http(s)` needs `network`) |
+| `rule_pack_sources` | `[]` | structured local/HTTPS sources with format and optional usage hints |
+| `rule_limits` | see below | bounds applied independently to external source transport |
 
-## Rule packs (ClearURLs format)
+The legacy `rule_packs` and `rule_pack_urls` string arrays remain supported and
+always mean ClearURLs JSON. Structured entries use `source`, with `path` and
+`url` accepted as aliases:
+
+```toml
+[[rule_pack_sources]]
+source = "/etc/email-privacy-cleaner/clearurls.json"
+format = "clear-urls"       # optional: auto, clear-urls, brave-clean-urls,
+                             #         brave-debounce, or adguard
+
+[[rule_pack_sources]]
+url = "https://example.invalid/filters.txt"
+format = "adguard"
+usage = "mail-beacon"       # permits modifierless AdGuard image rules
+```
+
+`format = "auto"` detects ClearURLs JSON, Brave Clean URLs JSON, Brave
+Debounce JSON, or AdGuard filter text. `mail-beacon` is optional and is only a
+purpose hint for AdGuard sources; it does not turn browser preferences or
+ordinary link rules into mail-beacon rules.
+
+External source loading is bounded by `[rule_limits]`, whose defaults are
+`max_rule_pack_bytes = 5242880` (5 MiB per source),
+`max_total_rule_pack_bytes = 26214400` (25 MiB total),
+`max_rule_pack_sources = 32`, `max_external_rules = 50000`,
+`max_regex_rules = 10000`, and `max_diagnostic_samples = 16`.
+
+## Rule packs and external formats
 
 The default tracking params, vendor rules, ESP redirect unwrappers and known
 beacon hosts ship as a **ClearURLs-format JSON document** compiled into the
@@ -255,6 +308,19 @@ via `rule_packs`, or URLs via `rule_pack_urls` with the `network` feature) and
 **merges** them on top of the built-ins, so coverage can be extended without
 code changes — including with the upstream [ClearURLs](https://clearurls.xyz)
 `data.min.json`.
+
+The indexed engine accepts ClearURLs Rules JSON, Brave Clean URLs JSON, Brave
+Debounce JSON, and the supported AdGuard filter subset. Their upstream data
+licences are, respectively, ClearURLs Rules **LGPL-3.0**, Brave lists
+**MPL-2.0**, and the AdGuard corpus **GPL-3.0**; these are separate from this
+crate's MIT OR Apache-2.0 licence and none of that data is bundled here.
+
+The format may be explicit or `auto`; a source's
+purpose must not be inferred from its filename or URL. In particular,
+modifierless AdGuard blocking rules require an explicit `mail-beacon` purpose;
+automatic AdGuard import may accept explicit `$image` rules. Brave browser
+preferences are not mail rules, and external beacon rules apply only to image
+and CSS-image contexts, never ordinary anchor links.
 
 Supported per provider: `urlPattern`, `rules` (param-name regexes),
 `referralMarketing`, `rawRules`, `exceptions`, `redirections` (capture group 1
@@ -266,9 +332,17 @@ crate (no catastrophic backtracking); patterns using unsupported features (e.g.
 lookaround in a third-party pack) are skipped individually while the rest of the
 pack still loads.
 
-> The upstream ClearURLs rules are copyleft (LGPL); this crate ships only the
-> parser, not that data. Download it and point `rule_packs`/`rule_pack_urls` at
-> it if you want it.
+> The upstream ClearURLs Rules are copyleft (LGPL-3.0); this crate ships only
+> the parser, not that data. Download it and point `rule_packs`/`rule_pack_urls`
+> at it if you want it.
+
+Rule-pack loading is startup-only: local paths and `file://` URLs are read
+locally, while HTTPS sources are fetched while configuration is finalized.
+Each distinct configured source has one load attempt at startup; duplicate
+source strings are collapsed, and no rule-pack source is loaded during
+per-message cleaning. The separate network redirect resolver is independently
+opt-in and can make per-message requests only when
+`network_redirect_resolution = true`.
 
 ## Redirect unwrapping
 

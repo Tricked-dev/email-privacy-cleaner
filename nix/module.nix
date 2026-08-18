@@ -19,10 +19,11 @@ let
   cfg = config.services.email-privacy-milter;
   tomlFormat = pkgs.formats.toml { };
 
-  # Resolve each rule pack to a store path. Plain paths pass through; an
-  # `{ url; sha256; }` entry is prefetched at build time with `fetchurl` and
-  # pinned by hash, so the daemon loads it offline from the store (the
-  # per-message cleaning path never touches the network). Passed to the daemon
+  # Resolve each legacy ClearURLs-format rule pack to a store path. Plain paths pass
+  # through; an `{ url; sha256; }` entry is prefetched at build time with
+  # `fetchurl` and pinned by hash, so the daemon loads it offline from the
+  # store. Rule-pack loading is startup-only and the per-message cleaning path
+  # never fetches a pack. Passed to the daemon
   # as `--rule-pack` args, so this composes with EITHER `settings` or
   # `configFile` — the packs merge on top of whatever `rule_packs` the config
   # already lists.
@@ -144,14 +145,33 @@ in
         ]
       '';
       description = ''
-        External ClearURLs-format rule packs to merge on top of the built-ins.
+        External ClearURLs-format JSON rule packs to merge on top of the
+        built-ins. ClearURLs Rules data is LGPL-3.0; Brave lists are MPL-2.0;
+        the AdGuard corpus is GPL-3.0. These upstream data licences are
+        separate from this package's MIT OR Apache-2.0 licence, and the data is
+        not bundled.
+
+        Structured sources are configured through {option}`settings` using
+        `rule_pack_sources`. Each entry uses `source`, with `path` and `url`
+        accepted as aliases; `format` is optional and accepts `auto`,
+        `clear-urls`, `brave-clean-urls`, `brave-debounce`, or `adguard`.
+        Optional `usage = "mail-beacon"` permits modifierless AdGuard image
+        rules. The legacy `rule_packs` and `rule_pack_urls` arrays remain
+        supported and mean ClearURLs JSON.
+
+        The default `rule_limits` are 5 MiB per source, 25 MiB total, 32
+        sources, 50,000 external rules, 10,000 regex rules, and 16 diagnostic
+        samples per source. Each distinct source is attempted once during
+        startup; duplicate source strings are collapsed and no source is
+        loaded during per-message cleaning.
+
         Each entry is either a path, or an `{ url; sha256; }` attrset that is
         fetched with {function}`fetchurl` and pinned. The resolved store paths
         are passed to the daemon as `--rule-pack` arguments and merged on top of
         the `rule_packs` in {option}`settings`/{option}`configFile`, so this
-        composes with both and needs no network access at runtime.
+        composes with both and needs no rule-pack network access at runtime.
 
-        > The upstream ClearURLs rules are copyleft (LGPL); only their
+        > The upstream ClearURLs Rules are copyleft (LGPL-3.0); only their
         > *parser* ships with this package. Prefetching the data here keeps your
         > build reproducible and offline.
       '';

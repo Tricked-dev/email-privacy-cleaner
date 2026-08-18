@@ -22,6 +22,9 @@ pub enum RejectReason {
     MixedScript,
     /// Host is a literal private / loopback / link-local / metadata IP.
     PrivateIp,
+    /// A Brave-derived redirect crossed a host boundary that cannot be
+    /// classified safely without a public-suffix list.
+    BraveDestinationScope,
 }
 
 impl RejectReason {
@@ -34,6 +37,7 @@ impl RejectReason {
             RejectReason::InvalidHost => "invalid-host".into(),
             RejectReason::MixedScript => "mixed-script".into(),
             RejectReason::PrivateIp => "private-ip".into(),
+            RejectReason::BraveDestinationScope => "brave-destination-scope".into(),
         }
     }
 }

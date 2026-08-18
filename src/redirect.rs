@@ -4,6 +4,8 @@
 //! unwrapped when the *destination* is explicitly embedded in the URL (usually
 //! a query parameter), the destination decodes to a valid `http(s)` URL, and it
 //! passes [`validate_destination`](crate::validate::validate_destination).
+//! Brave-derived rules additionally use a conservative exact-host boundary;
+//! legacy ClearURLs and built-in rules retain the existing validator alone.
 //!
 //! When unwrapping confidence is low (unknown provider, or no valid embedded
 //! destination) we keep the original URL but still strip known tracking query
@@ -15,6 +17,7 @@ use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::config::CleanerConfig;
+use crate::ruleset::RedirectOrigin;
 use crate::url_clean::clean_url;
 use crate::validate::{validate_destination, RejectReason};
 
@@ -65,9 +68,11 @@ pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapR
     let provider = ruleset.detect_provider(url_str).map(|s| s.to_string());
 
     if config.unwrap_known_redirects {
-        if let Some(raw) = ruleset.redirect_target(url_str) {
-            if let Some(candidate) = decode_candidate(&raw) {
-                match validate_destination(&candidate) {
+        if let Some(extracted) = ruleset.redirect_target_with_origin(url_str) {
+            if let Some(candidate) = decode_candidate(&extracted.target) {
+                match validate_destination(&candidate)
+                    .and_then(|()| validate_origin_destination(&extracted.origin, url, &candidate))
+                {
                     Ok(()) => {
                         // Clean tracking params off the *destination* too.
                         let cleaned = clean_url(&candidate, config).url;
@@ -117,6 +122,31 @@ pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapR
         unwrapped: false,
         provider,
         rejected: None,
+    }
+}
+
+/// Apply the additional safety boundary for Brave-derived redirects only.
+///
+/// This project intentionally does not ship a public-suffix list, so it
+/// cannot determine an exact registrable domain for arbitrary hostnames.
+/// Accepting cross-host Brave rewrites would therefore require guessing about
+/// eTLD+1 boundaries. The conservative fallback is exact host equality;
+/// cross-host Brave candidates remain visible links and are not rewritten.
+fn validate_origin_destination(
+    origin: &RedirectOrigin,
+    source: &Url,
+    candidate: &Url,
+) -> Result<(), RejectReason> {
+    if *origin != RedirectOrigin::Brave {
+        return Ok(());
+    }
+
+    let source_host = source.host_str().ok_or(RejectReason::InvalidHost)?;
+    let candidate_host = candidate.host_str().ok_or(RejectReason::InvalidHost)?;
+    if source_host.eq_ignore_ascii_case(candidate_host) {
+        Ok(())
+    } else {
+        Err(RejectReason::BraveDestinationScope)
     }
 }
 
@@ -339,9 +369,10 @@ mod tests {
     fn base64_segment_that_is_not_a_url_is_not_unwrapped() {
         // `aHR0c…` gates the rule, but a blob that decodes to something other
         // than an absolute URL must leave the link alone.
-        let u =
-            Url::parse("https://links.example.com/e/c/eyJlbWFpbF9pZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBIn0/abc")
-                .unwrap();
+        let u = Url::parse(
+            "https://links.example.com/e/c/eyJlbWFpbF9pZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBIn0/abc",
+        )
+        .unwrap();
         let r = unwrap_redirect_url(&u, &cfg());
         assert!(!r.unwrapped);
         assert_eq!(r.provider.as_deref(), Some("customerio-click"));

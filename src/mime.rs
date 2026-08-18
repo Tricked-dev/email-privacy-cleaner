@@ -326,9 +326,7 @@ fn declares_html(part: &mail_parser::MessagePart) -> bool {
     part.content_type()
         .map(|ct| {
             ct.ctype().eq_ignore_ascii_case("text")
-                && ct
-                    .subtype()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("html"))
+                && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("html"))
         })
         .unwrap_or(false)
 }
