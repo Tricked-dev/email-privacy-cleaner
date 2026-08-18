@@ -492,12 +492,22 @@ struct DirectProviderIndex {
 #[derive(Debug, Default)]
 struct DirectProviderTrie {
     nodes: Box<[DirectProviderTrieNode]>,
+    edges: Box<[DirectProviderTrieEdge]>,
+    matches: Box<[u32]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct DirectProviderTrieNode {
-    edges: Box<[(u8, usize)]>,
-    matches: Box<[usize]>,
+    edge_start: u32,
+    edge_len: u32,
+    match_start: u32,
+    match_len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectProviderTrieEdge {
+    byte: u8,
+    next: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2217,36 +2227,66 @@ impl DirectProviderTrie {
             }
             nodes[node].matches.push(*provider_id);
         }
+        let mut flat_nodes = Vec::with_capacity(nodes.len());
+        let mut edges = Vec::with_capacity(nodes.iter().map(|node| node.edges.len()).sum());
+        let mut matches = Vec::with_capacity(nodes.iter().map(|node| node.matches.len()).sum());
+        for mut node in nodes {
+            node.edges.sort_unstable_by_key(|(edge, _)| *edge);
+            let edge_start = u32::try_from(edges.len()).expect("provider trie edge limit");
+            let edge_len = u32::try_from(node.edges.len()).expect("provider trie edge limit");
+            edges.extend(
+                node.edges
+                    .into_iter()
+                    .map(|(byte, next)| DirectProviderTrieEdge {
+                        byte,
+                        next: u32::try_from(next).expect("provider trie node limit"),
+                    }),
+            );
+            let match_start = u32::try_from(matches.len()).expect("provider trie match limit");
+            let match_len = u32::try_from(node.matches.len()).expect("provider trie match limit");
+            matches.extend(
+                node.matches
+                    .into_iter()
+                    .map(|index| u32::try_from(index).expect("provider index limit")),
+            );
+            flat_nodes.push(DirectProviderTrieNode {
+                edge_start,
+                edge_len,
+                match_start,
+                match_len,
+            });
+        }
         Self {
-            nodes: nodes
-                .into_iter()
-                .map(|mut node| {
-                    node.edges.sort_unstable_by_key(|(edge, _)| *edge);
-                    DirectProviderTrieNode {
-                        edges: node.edges.into_boxed_slice(),
-                        matches: node.matches.into_boxed_slice(),
-                    }
-                })
-                .collect(),
+            nodes: flat_nodes.into_boxed_slice(),
+            edges: edges.into_boxed_slice(),
+            matches: matches.into_boxed_slice(),
         }
     }
 
     fn match_at(&self, value: &str, start: usize, matches: &mut [bool]) {
         let mut node = 0;
-        for provider_id in self.nodes[node].matches.iter() {
-            matches[*provider_id] = true;
-        }
+        let Some(root) = self.nodes.get(node) else {
+            return;
+        };
+        self.mark_matches(root, matches);
         for byte in value[start..].bytes().map(|byte| byte.to_ascii_lowercase()) {
-            let Ok(edge) = self.nodes[node]
-                .edges
-                .binary_search_by_key(&byte, |(edge, _)| *edge)
-            else {
+            let trie_node = self.nodes[node];
+            let edge_start = trie_node.edge_start as usize;
+            let edge_end = edge_start + trie_node.edge_len as usize;
+            let node_edges = &self.edges[edge_start..edge_end];
+            let Ok(edge) = node_edges.binary_search_by_key(&byte, |edge| edge.byte) else {
                 return;
             };
-            node = self.nodes[node].edges[edge].1;
-            for provider_id in self.nodes[node].matches.iter() {
-                matches[*provider_id] = true;
-            }
+            node = node_edges[edge].next as usize;
+            self.mark_matches(&self.nodes[node], matches);
+        }
+    }
+
+    fn mark_matches(&self, node: &DirectProviderTrieNode, matched: &mut [bool]) {
+        let start = node.match_start as usize;
+        let end = start + node.match_len as usize;
+        for &provider_id in &self.matches[start..end] {
+            matched[provider_id as usize] = true;
         }
     }
 }
@@ -2610,28 +2650,10 @@ fn compile_redirect_extractor(ir: &RedirectExtractorIr) -> Option<RedirectExtrac
 fn compile_redirect_extractors(
     pending: &[PendingRedirectCompile],
 ) -> Vec<Option<RedirectExtractor>> {
-    if pending.len() < 2 {
-        return pending
-            .iter()
-            .map(|rule| compile_redirect_extractor(&rule.extractor))
-            .collect();
-    }
-    let midpoint = pending.len().div_ceil(2);
-    let (left, right) = pending.split_at(midpoint);
-    std::thread::scope(|scope| {
-        let right = scope.spawn(|| {
-            right
-                .iter()
-                .map(|rule| compile_redirect_extractor(&rule.extractor))
-                .collect::<Vec<_>>()
-        });
-        let mut compiled = left
-            .iter()
-            .map(|rule| compile_redirect_extractor(&rule.extractor))
-            .collect::<Vec<_>>();
-        compiled.extend(right.join().expect("redirect compiler worker panicked"));
-        compiled
-    })
+    pending
+        .iter()
+        .map(|rule| compile_redirect_extractor(&rule.extractor))
+        .collect()
 }
 
 fn extract_redirect_target(
@@ -4105,6 +4127,21 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn compact_provider_trie_handles_empty_and_overlapping_patterns() {
+        let empty = DirectProviderTrie::new(&[]);
+        empty.match_at("anything", 0, &mut []);
+
+        let trie = DirectProviderTrie::new(&[("example", 0), ("example.com", 1), ("example", 2)]);
+        let mut matched = [false; 3];
+        trie.match_at("EXAMPLE.COM/path", 0, &mut matched);
+        assert_eq!(matched, [true, true, true]);
+
+        let mut partial = [false; 3];
+        trie.match_at("prefix.example.com", 7, &mut partial);
+        assert_eq!(partial, [true, true, true]);
     }
 
     #[test]
