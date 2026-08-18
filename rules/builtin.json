@@ -56,6 +56,7 @@
       ]
     },
     "amazon": {
+      "_comment": "Marketing mail routes every link through /gp/r.html, whose M=urn:rtn:msg:<send-id> makes each click attributable to the recipient. The destination is the percent-encoded U= parameter — the same URL the message's own text/plain alternative links to directly.",
       "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?(?:amazon(?:\\.[a-z]{2,}){1,}|amzn\\.to)",
       "completeProvider": false,
       "rules": [
@@ -80,6 +81,9 @@
         "creativeasin",
         "creative",
         "camp"
+      ],
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?amazon(?:\\.[a-z]{2,}){1,}/gp/r\\.html\\?(?:[^&]*&)*U=([^&]+)"
       ]
     },
     "youtube": {
@@ -346,9 +350,28 @@
       "rules": ["ct"]
     },
     "awstrack": {
-      "_comment": "Amazon SES open/click tracking. Destination is the last path segment (often base64). Mark as a wrapper host for visibility; offline unwrap is not safe because the segment is encoded with an HMAC.",
+      "_comment": "Amazon SES open/click tracking. Click links put the percent-encoded destination in the first path segment after /L0/ (the trailing segments are the send id and an HMAC), so they unwrap offline. Open-tracking beacons instead end in an opaque HMAC segment with no destination — those only match urlPattern.",
       "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?awstrack\\.me",
-      "completeProvider": false
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?awstrack\\.me/L0/(https?[:%][^/]+)"
+      ]
+    },
+    "clicktrack-b64-path": {
+      "_comment": "ESP click trackers that base64url the destination into a path segment: /lnk/<id>/<n>/<token>/<base64-url> (Mailjet, including the customer-branded sending hosts it powers) and /<id>/<id>/<base64-url> (Kit/ConvertKit). base64 of 'http' is always the literal prefix 'aHR0c', which is what gates this rule — the host is unpredictable, the encoding is not.",
+      "urlPattern": "^https?://[^/]+/(?:[^/]+/)*aHR0c",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://[^/]+/(?:[^/]+/)*?(aHR0c[A-Za-z0-9+_=-]+)"
+      ]
+    },
+    "clicktrack-cl0": {
+      "_comment": "ESP click trackers that prefix the percent-encoded destination as the first path segment: /CL0/<encoded-url>/<n>/<send-id>/<hmac>. Used by several platforms on customer-branded hosts, so the host is unpredictable and the path shape is the only reliable signal. Requiring the segment to start with http(s) plus ':' or '%' keeps a bare /CL0/ path from matching.",
+      "urlPattern": "^https?://[^/]+/CL0/https?[:%]",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://[^/]+/CL0/(https?[:%][^/]+)"
+      ]
     },
     "mailjet": {
       "_comment": "Mailjet click tracking on *.mjt.lu. Path shape: /lnk/<id>/<n>/<token>/<base64-destination>",
@@ -366,6 +389,22 @@
       "completeProvider": false,
       "redirections": [
         "^https?://(?:[a-z0-9-]+\\.)*?safelink\\.emails\\.azure\\.net/redirect/?\\?.*?destination=([^&]+)"
+      ]
+    },
+    "customerio-click": {
+      "_comment": "Customer.io click tracking, on customeriomail.com and on the customer-branded sending hosts it powers. The /e/c/ segment is a base64url JSON envelope carrying the destination under `href`; the trailing segment is an HMAC. Gated on the literal 'eyJ' ('{\"' in base64) so only an actual JSON envelope is decoded.",
+      "urlPattern": "^https?://[^/]+/e/c/eyJ",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://[^/]+/e/c/(eyJ[A-Za-z0-9+_=-]+)"
+      ]
+    },
+    "parcellab": {
+      "_comment": "parcelLab delivery-notification click tracking, as used in retailer order/shipping mail. The `to` parameter is a base64url JSON envelope with the destination under `url`.",
+      "urlPattern": "^https?://(?:[a-z0-9-]+\\.)*?versand-status\\.de/click/",
+      "completeProvider": false,
+      "redirections": [
+        "^https?://(?:[a-z0-9-]+\\.)*?versand-status\\.de/click/[^/]+/forward\\?(?:[^&]*&)*to=(eyJ[A-Za-z0-9%+_=-]+)"
       ]
     },
     "customerio-pixel": {

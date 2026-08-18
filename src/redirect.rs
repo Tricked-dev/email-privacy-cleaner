@@ -9,6 +9,8 @@
 //! destination) we keep the original URL but still strip known tracking query
 //! parameters.
 
+use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::Engine;
 use percent_encoding::percent_decode_str;
 use url::Url;
 
@@ -19,6 +21,11 @@ use crate::validate::{validate_destination, RejectReason};
 /// Maximum number of nested URL-decode passes applied to a candidate
 /// destination value.
 pub const MAX_DECODE_DEPTH: usize = 3;
+
+/// Shortest candidate worth attempting a base64 decode on. The base64 of the
+/// shortest imaginable absolute URL is longer than this, so anything below it
+/// is noise.
+const MIN_BASE64_LEN: usize = 16;
 
 /// Outcome of [`unwrap_redirect_url`](crate::unwrap_redirect_url).
 #[derive(Debug, Clone)]
@@ -114,8 +121,8 @@ pub fn unwrap_redirect_url(url: &Url, config: &CleanerConfig) -> RedirectUnwrapR
 }
 
 /// Decode a candidate destination value, peeling up to [`MAX_DECODE_DEPTH`]
-/// layers of percent-encoding. Returns the first layer that parses as an
-/// absolute URL.
+/// layers of percent-encoding, then falling back to base64. Returns the first
+/// layer that parses as an absolute URL.
 ///
 /// We return the URL even when its scheme isn't http/https (e.g. `javascript:`,
 /// `data:`) so the caller's `validate_destination` can produce a meaningful
@@ -138,7 +145,40 @@ fn decode_candidate(raw: &str) -> Option<Url> {
         }
         current = decoded;
     }
-    None
+    decode_base64_candidate(&current)
+}
+
+/// Several ESPs base64 the destination instead of percent-encoding it: either
+/// the URL on its own (Mailjet, Kit) or a small JSON envelope carrying it under
+/// `href`/`url` (Customer.io, parcelLab). Both shapes are decoded here; the
+/// result is still handed back to the caller for `validate_destination` like
+/// any other candidate.
+fn decode_base64_candidate(raw: &str) -> Option<Url> {
+    let text = String::from_utf8(decode_base64_loose(raw)?).ok()?;
+    let text = text.trim();
+
+    if let Ok(u) = Url::parse(text) {
+        return Some(u);
+    }
+
+    let envelope: serde_json::Value = serde_json::from_str(text).ok()?;
+    ["href", "url"]
+        .iter()
+        .filter_map(|key| envelope.get(key).and_then(serde_json::Value::as_str))
+        .find_map(|dest| Url::parse(dest).ok())
+}
+
+/// base64-decode accepting the URL-safe and standard alphabets, padded or not —
+/// wrappers in the wild use every combination.
+fn decode_base64_loose(raw: &str) -> Option<Vec<u8>> {
+    let raw = raw.trim_end_matches('=');
+    if raw.len() < MIN_BASE64_LEN {
+        return None;
+    }
+    URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| STANDARD_NO_PAD.decode(raw))
+        .ok()
 }
 
 #[cfg(test)]
@@ -229,6 +269,107 @@ mod tests {
             !r.unwrapped,
             "must not unwrap from a `my_url_id=` substring"
         );
+    }
+
+    #[test]
+    fn unwraps_amazon_gp_r_html() {
+        // Amazon marketing mail: the destination is the `U=` parameter, and the
+        // wrapper carries the per-send `M=urn:rtn:msg:…` click identifier.
+        let u = Url::parse(
+            "https://www.amazon.co.uk/gp/r.html?C=AAAAAAAAAAAAA&K=BBBBBBBBBBB&M=urn:rtn:msg:00000000000000000000000000000000000000p0eu&R=CCCCCCCCCCCC&T=C&U=https%3A%2F%2Fwww.amazon.co.uk%2Fb%3Fnode%3D123456%26ref_%3Dpe_000000_0000000_TLH_00_01_BT_00&H=DDDDDDDDDDDDDDDDDDDDDDDDDDDD&ref_=pe_000000_0000000_TLH_00_01_BT_00",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("amazon"));
+        // `ref_` is Amazon tracking and must come off the destination too.
+        assert_eq!(r.url.as_str(), "https://www.amazon.co.uk/b?node=123456");
+    }
+
+    #[test]
+    fn unwraps_cl0_path_destination() {
+        let u = Url::parse(
+            "https://c.example-esp.com/CL0/https:%2F%2Fexample.com%2Fp%3Futm_source=email/1/0000000000000000-00000000/AAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("clicktrack-cl0"));
+        assert_eq!(r.url.as_str(), "https://example.com/p");
+    }
+
+    #[test]
+    fn unwraps_base64_url_in_path_segment() {
+        // Mailjet-shaped wrapper: the last path segment is base64url("https://…").
+        let u = Url::parse(
+            "https://secure.example.com/lnk/AAAAAAAAAAAAAAAAAAAAAAAAAAAA/9/BBBBBBBBBBBBBBBBBBBBBB/aHR0cHM6Ly9leGFtcGxlLmNvbS9wP3V0bV9zb3VyY2U9ZW1haWw",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("clicktrack-b64-path"));
+        assert_eq!(r.url.as_str(), "https://example.com/p");
+    }
+
+    #[test]
+    fn unwraps_customerio_base64_json_envelope() {
+        let u = Url::parse(
+            "https://links.example.com/e/c/eyJlbWFpbF9pZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBIiwiaHJlZiI6Imh0dHBzOi8vZXhhbXBsZS5jb20vcD91dG1fY2FtcGFpZ249eCIsImxpbmtfaWQiOjF9/00000000000000000000000000000000",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("customerio-click"));
+        assert_eq!(r.url.as_str(), "https://example.com/p");
+    }
+
+    #[test]
+    fn unwraps_parcellab_base64_json_param() {
+        let u = Url::parse(
+            "https://parcel-api.versand-status.de/click/000000000000000000000000/forward?to=eyJlbWFpbElkIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwidXJsIjoiaHR0cHM6Ly9leGFtcGxlLmNvbS9ubC8ifQ&sig=00000000000000000000000000000000",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("parcellab"));
+        assert_eq!(r.url.as_str(), "https://example.com/nl/");
+    }
+
+    #[test]
+    fn base64_segment_that_is_not_a_url_is_not_unwrapped() {
+        // `aHR0c…` gates the rule, but a blob that decodes to something other
+        // than an absolute URL must leave the link alone.
+        let u =
+            Url::parse("https://links.example.com/e/c/eyJlbWFpbF9pZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBIn0/abc")
+                .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(!r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("customerio-click"));
+    }
+
+    #[test]
+    fn unwraps_awstrack_l0_path_destination() {
+        let u = Url::parse(
+            "https://aaaaaaaa.r.us-east-1.awstrack.me/L0/https:%2F%2Fexample.com%2Fhome%3Futm_medium=crm/1/0000000000000000-00000000/AAAAAAAAAAAAAAAAAAAAAAAAAAA=000",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("awstrack"));
+        assert_eq!(r.url.as_str(), "https://example.com/home");
+    }
+
+    #[test]
+    fn awstrack_open_beacon_without_destination_is_not_unwrapped() {
+        // Open-tracking beacons have no destination segment — the wrapper must
+        // survive rather than be rewritten to something invented.
+        let u = Url::parse(
+            "https://aaaaaaaa.r.us-east-1.awstrack.me/I0/0000000000000000-00000000/AAAAAAAAAAAAAAAAAAAAAAAAAAA=000",
+        )
+        .unwrap();
+        let r = unwrap_redirect_url(&u, &cfg());
+        assert!(!r.unwrapped);
+        assert_eq!(r.provider.as_deref(), Some("awstrack"));
     }
 
     #[test]
