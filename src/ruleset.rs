@@ -6,7 +6,9 @@
 //! important: ClearURLs, Brave Clean URLs, and AdGuard do not agree on query
 //! decoding, case sensitivity, or exception scope.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -596,20 +598,11 @@ struct CompiledParamMatcher {
 }
 
 impl CompiledParamMatcher {
-    fn matches(&self, segment: &str, chunks: &[RegexSetChunk]) -> bool {
-        let (raw_name, has_equals, raw_value) = split_query_segment(segment);
-        if self.requires_equals && !has_equals {
+    fn matches(&self, segment: &QuerySegment<'_>, chunks: &[RegexSetChunk]) -> bool {
+        if self.requires_equals && !segment.has_equals {
             return false;
         }
-        let decoded_name = decode_query_component(raw_name);
-        let subject = match self.subject {
-            ParamSubject::RawName => raw_name.to_string(),
-            ParamSubject::DecodedName => decoded_name.clone(),
-            ParamSubject::DecodedPair => {
-                let value = decode_query_component(raw_value);
-                format!("{decoded_name}={value}")
-            }
-        };
+        let subject = segment.subject(self.subject);
 
         match &self.kind {
             CompiledMatcherKind::Exact(value) => {
@@ -620,17 +613,94 @@ impl CompiledParamMatcher {
                 }
             }
             CompiledMatcherKind::Prefix(value) => {
-                if self.case_sensitive {
-                    subject.starts_with(value.as_ref())
-                } else {
-                    subject.to_ascii_lowercase().starts_with(value.as_ref())
-                }
+                subject.get(..value.len()).is_some_and(|prefix| {
+                    if self.case_sensitive {
+                        prefix == value.as_ref()
+                    } else {
+                        prefix.eq_ignore_ascii_case(value)
+                    }
+                })
             }
             CompiledMatcherKind::Regex { chunk, index } => chunks
                 .get(*chunk)
-                .map(|chunk| chunk.set.matches(&subject).matched(*index))
-                .unwrap_or(false),
+                .is_some_and(|_| segment.regex_matched(self.subject, chunks, *chunk, *index)),
         }
+    }
+}
+
+struct QuerySegment<'a> {
+    raw_name: &'a str,
+    raw_value: &'a str,
+    has_equals: bool,
+    decoded_name: OnceCell<Cow<'a, str>>,
+    decoded_pair: OnceCell<String>,
+    raw_regex_matches: OnceCell<Vec<OnceCell<Box<[usize]>>>>,
+    decoded_name_regex_matches: OnceCell<Vec<OnceCell<Box<[usize]>>>>,
+    decoded_pair_regex_matches: OnceCell<Vec<OnceCell<Box<[usize]>>>>,
+}
+
+impl<'a> QuerySegment<'a> {
+    fn new(segment: &'a str) -> Self {
+        let (raw_name, has_equals, raw_value) = split_query_segment(segment);
+        Self {
+            raw_name,
+            raw_value,
+            has_equals,
+            decoded_name: OnceCell::new(),
+            decoded_pair: OnceCell::new(),
+            raw_regex_matches: OnceCell::new(),
+            decoded_name_regex_matches: OnceCell::new(),
+            decoded_pair_regex_matches: OnceCell::new(),
+        }
+    }
+
+    fn decoded_name(&self) -> &str {
+        self.decoded_name
+            .get_or_init(|| decode_query_component(self.raw_name))
+    }
+
+    fn subject(&self, subject: ParamSubject) -> &str {
+        match subject {
+            ParamSubject::RawName => self.raw_name,
+            ParamSubject::DecodedName => self.decoded_name(),
+            ParamSubject::DecodedPair => self.decoded_pair.get_or_init(|| {
+                let name = self.decoded_name();
+                let value = decode_query_component(self.raw_value);
+                let mut pair = String::with_capacity(name.len() + 1 + value.len());
+                pair.push_str(name);
+                pair.push('=');
+                pair.push_str(&value);
+                pair
+            }),
+        }
+    }
+
+    fn regex_matched(
+        &self,
+        subject: ParamSubject,
+        chunks: &[RegexSetChunk],
+        chunk: usize,
+        index: usize,
+    ) -> bool {
+        let value = self.subject(subject);
+        let cache = match subject {
+            ParamSubject::RawName => &self.raw_regex_matches,
+            ParamSubject::DecodedName => &self.decoded_name_regex_matches,
+            ParamSubject::DecodedPair => &self.decoded_pair_regex_matches,
+        }
+        .get_or_init(|| (0..chunks.len()).map(|_| OnceCell::new()).collect());
+        let Some(chunk_cache) = cache.get(chunk) else {
+            return false;
+        };
+        let matched = chunk_cache.get_or_init(|| {
+            chunks[chunk]
+                .set
+                .matches(value)
+                .iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        matched.binary_search(&index).is_ok()
     }
 }
 
@@ -1047,20 +1117,27 @@ impl Ruleset {
     /// should retain this context instead of rescanning provider scopes.
     pub fn context_for<'a>(&'a self, raw_url: &'a str, parsed_url: &'a Url) -> UrlContext<'a> {
         let provider_matches = match_provider_patterns(&self.store, raw_url);
-        let mut candidates = BTreeSet::new();
+        let mut candidates = Vec::with_capacity(
+            self.store.scope_index.global.len() + self.store.scope_index.generic.len() + 8,
+        );
         candidates.extend(self.store.scope_index.global.iter().copied());
         candidates.extend(self.store.scope_index.generic.iter().copied());
 
         if let Some(host) = parsed_url.host_str() {
-            let host = host.to_ascii_lowercase();
-            let labels: Vec<&str> = host.split('.').collect();
-            for index in 0..labels.len() {
-                let suffix = labels[index..].join(".");
-                if let Some(groups) = self.store.scope_index.suffix.get(suffix.as_str()) {
+            let mut suffix = host;
+            loop {
+                if let Some(groups) = self.store.scope_index.suffix.get(suffix) {
                     candidates.extend(groups.iter().copied());
                 }
+                let Some(dot) = suffix.find('.') else {
+                    break;
+                };
+                suffix = &suffix[dot + 1..];
             }
         }
+
+        candidates.sort_unstable();
+        candidates.dedup();
 
         let active: Vec<usize> = candidates
             .into_iter()
@@ -1372,12 +1449,13 @@ impl UrlContext<'_> {
         include_vendor: bool,
         include_referral: bool,
     ) -> bool {
+        let segment = QuerySegment::new(segment);
         for group_id in self.candidate_groups.iter().copied() {
             let action = &self.store.actions[self.store.groups[group_id].action];
             if action.exception || !action_enabled(action, self, include_vendor, include_referral) {
                 continue;
             }
-            if !action.matcher.matches(segment, &self.store.regex_chunks) {
+            if !action.matcher.matches(&segment, &self.store.regex_chunks) {
                 continue;
             }
             // ClearURLs exceptions are URL-wide within the matching provider.
@@ -1402,7 +1480,7 @@ impl UrlContext<'_> {
             if action.source == SourceKind::AdGuard
                 && self.has_matching_adguard_exception(
                     action,
-                    segment,
+                    &segment,
                     include_vendor,
                     include_referral,
                 )
@@ -1417,7 +1495,7 @@ impl UrlContext<'_> {
     fn has_matching_adguard_exception(
         &self,
         positive: &ParamAction,
-        segment: &str,
+        segment: &QuerySegment<'_>,
         include_vendor: bool,
         include_referral: bool,
     ) -> bool {
@@ -2495,14 +2573,6 @@ fn compile_whole_url_pattern(pattern: &str) -> Option<Regex> {
     checked_regex(&format!("(?i){pattern}")).ok()
 }
 
-fn format_regex_for_scope(pattern: &str) -> String {
-    if pattern.starts_with("(?i)") {
-        pattern.to_string()
-    } else {
-        format!("(?i){pattern}")
-    }
-}
-
 fn compile_redirect_extractor(ir: &RedirectExtractorIr) -> Option<RedirectExtractor> {
     match ir {
         RedirectExtractorIr::ClearUrls { pattern } => {
@@ -2785,10 +2855,17 @@ fn scopes_match_embedded_beacon(store: &RuleStore, raw_url: &str) -> bool {
     false
 }
 
-fn decode_query_component(value: &str) -> String {
-    percent_decode_str(&value.replace('+', " "))
-        .decode_utf8_lossy()
-        .into_owned()
+fn decode_query_component(value: &str) -> Cow<'_, str> {
+    if value.as_bytes().contains(&b'+') {
+        let form_value = value.replace('+', " ");
+        Cow::Owned(
+            percent_decode_str(&form_value)
+                .decode_utf8_lossy()
+                .into_owned(),
+        )
+    } else {
+        percent_decode_str(value).decode_utf8_lossy()
+    }
 }
 
 fn host_suffix_matches(host: &str, suffix: &str) -> bool {
@@ -2923,6 +3000,51 @@ fn adguard_glob_matches_at(
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
+    if pattern.is_ascii() && value.is_ascii() {
+        return glob_matches_ascii(pattern.as_bytes(), value.as_bytes());
+    }
+    glob_matches_unicode(pattern, value)
+}
+
+fn glob_matches_ascii(pattern: &[u8], value: &[u8]) -> bool {
+    let mut pattern_index = 0usize;
+    let mut value_index = 0usize;
+    let mut star = None;
+    let mut star_value = 0usize;
+
+    loop {
+        if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_value = value_index;
+            continue;
+        }
+        if pattern_index < pattern.len()
+            && value_index < value.len()
+            && (pattern[pattern_index] == b'?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&value[value_index]))
+        {
+            pattern_index += 1;
+            value_index += 1;
+            continue;
+        }
+        if pattern_index == pattern.len() && value_index == value.len() {
+            return true;
+        }
+
+        let Some(star_index) = star else {
+            return false;
+        };
+        if star_value == value.len() {
+            return false;
+        }
+        star_value += 1;
+        pattern_index = star_index + 1;
+        value_index = star_value;
+    }
+}
+
+fn glob_matches_unicode(pattern: &str, value: &str) -> bool {
     let mut pattern = pattern.chars().peekable();
     let mut value = value.chars().peekable();
     let mut star_pattern = None;
@@ -3860,38 +3982,53 @@ fn expand_hir(hir: &Hir, cap: usize) -> Option<Vec<String>> {
     }
 }
 
+#[derive(Hash, PartialEq, Eq)]
+enum RegexBudgetKey<'a> {
+    UrlPattern(&'a str),
+    UrlException(&'a str),
+    Parameter {
+        pattern: &'a str,
+        subject: ParamSubject,
+        case_sensitive: bool,
+        requires_equals: bool,
+    },
+    Scope(&'a ScopeSpec),
+    Redirect(&'a str),
+    Beacon(&'a str),
+    Raw(&'a str),
+}
+
+fn case_insensitive_pattern_key(pattern: &str) -> &str {
+    pattern.strip_prefix("(?i)").unwrap_or(pattern)
+}
+
 fn count_regex_rules(source: &SourceIr) -> usize {
-    let mut expressions = HashSet::<String>::new();
+    let mut expressions = HashSet::<RegexBudgetKey<'_>>::new();
 
     for provider in &source.providers {
-        add_regex_budget_expression(
-            &mut expressions,
-            "url-pattern",
-            &format_regex_for_scope(provider.url_pattern.as_ref()),
-        );
+        expressions.insert(RegexBudgetKey::UrlPattern(case_insensitive_pattern_key(
+            &provider.url_pattern,
+        )));
         for exception in &provider.exceptions {
-            add_regex_budget_expression(
-                &mut expressions,
-                "url-exception",
-                &format_regex_for_scope(exception),
-            );
+            expressions.insert(RegexBudgetKey::UrlException(case_insensitive_pattern_key(
+                exception,
+            )));
         }
     }
     for rule in &source.params {
-        if matches!(rule.matcher, ParamMatcherSpec::Regex { .. }) {
-            if let ParamMatcherSpec::Regex {
+        if let ParamMatcherSpec::Regex {
+            pattern,
+            subject,
+            case_sensitive,
+            requires_equals,
+        } = &rule.matcher
+        {
+            expressions.insert(RegexBudgetKey::Parameter {
                 pattern,
-                subject,
-                case_sensitive,
-                requires_equals,
-            } = &rule.matcher
-            {
-                add_regex_budget_expression(
-                    &mut expressions,
-                    "parameter",
-                    &format!("{subject:?}:{case_sensitive}:{requires_equals}:{pattern}"),
-                );
-            }
+                subject: *subject,
+                case_sensitive: *case_sensitive,
+                requires_equals: *requires_equals,
+            });
         }
         for scope in rule.include.iter().chain(rule.exclude.iter()) {
             add_regex_budget_scope(&mut expressions, scope);
@@ -3908,7 +4045,7 @@ fn count_regex_rules(source: &SourceIr) -> usize {
             match &rule.extractor {
                 RedirectExtractorIr::ClearUrls { pattern }
                 | RedirectExtractorIr::PathRegex { pattern, .. } => {
-                    add_regex_budget_expression(&mut expressions, "redirect", pattern);
+                    expressions.insert(RegexBudgetKey::Redirect(pattern));
                 }
                 RedirectExtractorIr::QueryParam { .. } => unreachable!(),
             }
@@ -3919,35 +4056,97 @@ fn count_regex_rules(source: &SourceIr) -> usize {
             add_regex_budget_scope(&mut expressions, scope);
         }
         if rule.raw_pattern.is_some() {
-            add_regex_budget_expression(
-                &mut expressions,
-                "beacon",
+            expressions.insert(RegexBudgetKey::Beacon(
                 rule.raw_pattern.as_deref().unwrap_or_default(),
-            );
+            ));
         }
     }
     for rule in &source.raw_rules {
         for scope in &rule.include {
             add_regex_budget_scope(&mut expressions, scope);
         }
-        add_regex_budget_expression(&mut expressions, "raw", &rule.pattern);
+        expressions.insert(RegexBudgetKey::Raw(&rule.pattern));
     }
     expressions.len()
 }
 
-fn add_regex_budget_scope(expressions: &mut HashSet<String>, scope: &ScopeSpec) {
+fn add_regex_budget_scope<'a>(expressions: &mut HashSet<RegexBudgetKey<'a>>, scope: &'a ScopeSpec) {
     if !matches!(scope, ScopeSpec::Any) {
-        expressions.insert(format!("scope:{scope:?}"));
+        expressions.insert(RegexBudgetKey::Scope(scope));
     }
-}
-
-fn add_regex_budget_expression(expressions: &mut HashSet<String>, kind: &str, pattern: &str) {
-    expressions.insert(format!("{kind}:{pattern}"));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_segment_reuses_decoded_subjects_and_regex_set_results() {
+        let segment = QuerySegment::new("utm%5Fsource=hello+world");
+        assert_eq!(segment.subject(ParamSubject::RawName), "utm%5Fsource");
+        assert_eq!(segment.subject(ParamSubject::DecodedName), "utm_source");
+        assert_eq!(
+            segment.subject(ParamSubject::DecodedPair),
+            "utm_source=hello world"
+        );
+
+        let chunks = [RegexSetChunk {
+            set: RegexSet::new([r"^utm_source$", r"^other$"]).unwrap(),
+        }];
+        assert!(segment.regex_matched(ParamSubject::DecodedName, &chunks, 0, 0));
+        assert!(!segment.regex_matched(ParamSubject::DecodedName, &chunks, 0, 1));
+        assert_eq!(
+            segment
+                .decoded_name_regex_matches
+                .get()
+                .unwrap()
+                .iter()
+                .filter(|matches| matches.get().is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn regex_budget_uses_typed_deduplicated_keys() {
+        let provider = |pattern: &str| ProviderIr {
+            name: "provider".into(),
+            global: false,
+            complete: false,
+            url_pattern: pattern.into(),
+            exceptions: vec!["same".into()],
+        };
+        let parameter = |subject| ParamRuleIr {
+            source: SourceKind::ClearUrls,
+            provider: None,
+            global: false,
+            referral: false,
+            exception: false,
+            exception_all: false,
+            matcher: ParamMatcherSpec::Regex {
+                pattern: "same".into(),
+                subject,
+                case_sensitive: false,
+                requires_equals: false,
+            },
+            include: vec![ScopeSpec::UrlGlob("*://example.test/*".into())],
+            exclude: vec![ScopeSpec::Any],
+            report_index: 0,
+        };
+        let source = SourceIr {
+            providers: vec![provider("same"), provider("(?i)same")],
+            params: vec![
+                parameter(ParamSubject::RawName),
+                parameter(ParamSubject::RawName),
+                parameter(ParamSubject::DecodedName),
+            ],
+            ..SourceIr::default()
+        };
+
+        // Provider patterns normalize an existing `(?i)` prefix, while each
+        // expression kind and structurally distinct parameter remain separate.
+        assert_eq!(count_regex_rules(&source), 5);
+    }
 
     #[test]
     fn builtin_compiles_with_no_skipped_patterns() {
