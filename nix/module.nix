@@ -136,8 +136,8 @@ in
         [
           # A pack already in the store / repo:
           ./my-extra-rules.json
-          # Or prefetch the upstream ClearURLs data (pinned by hash) so it is
-          # baked into the store and loaded fully offline at runtime:
+          # Or prefetch an external pack (pinned by hash) so it is baked into
+          # the store and loaded fully offline at runtime:
           {
             url = "https://rules2.clearurls.xyz/data.min.json";
             sha256 = "sha256-AAAA...";
@@ -145,11 +145,10 @@ in
         ]
       '';
       description = ''
-        External ClearURLs-format JSON rule packs to merge on top of the
-        built-ins. ClearURLs Rules data is LGPL-3.0; Brave lists are MPL-2.0;
-        the AdGuard corpus is GPL-3.0. These upstream data licences are
-        separate from this package's MIT OR Apache-2.0 licence, and the data is
-        not bundled.
+        The binary includes only a small, manually maintained built-in list.
+        These optional external rule packs are merged on top of it; external
+        formats can be configured through local paths, HTTPS sources, or
+        Nix-prefetched store paths, and the data is not bundled.
 
         Structured sources are configured through {option}`settings` using
         `rule_pack_sources`. Each entry uses `source`, with `path` and `url`
@@ -171,9 +170,8 @@ in
         the `rule_packs` in {option}`settings`/{option}`configFile`, so this
         composes with both and needs no rule-pack network access at runtime.
 
-        > The upstream ClearURLs Rules are copyleft (LGPL-3.0); only their
-        > *parser* ships with this package. Prefetching the data here keeps your
-        > build reproducible and offline.
+        Prefetching external data here keeps the build reproducible and lets
+        the daemon load it fully offline at runtime.
       '';
     };
 

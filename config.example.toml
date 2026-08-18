@@ -149,21 +149,15 @@ disabled_providers = [
 
 # --- External rule packs and format contract --------------------------------
 #
-# The built-in rules ship as a ClearURLs-format JSON document compiled into the
-# binary (rules/builtin.json). You can layer additional ClearURLs-format packs
-# on top — including the upstream ClearURLs data.min.json — to extend coverage
-# without code changes. Loaded packs AUGMENT the built-ins (union of providers).
+# The binary includes only a small, manually maintained built-in list in
+# rules/builtin.json. You can layer optional external packs on top to extend
+# coverage without code changes. Loaded packs augment the built-ins.
 #
 # The string arrays below are supported and mean ClearURLs JSON.
 # Structured entries use `source`; `path` and `url` are accepted aliases.
 # `format` is optional and accepts `auto`, `clear-urls`, `brave-clean-urls`,
 # `brave-debounce`, or `adguard`. `usage` is optional and accepts
-# only `mail-beacon`. The upstream data licences are ClearURLs Rules LGPL-3.0,
-# Brave lists MPL-2.0, and the AdGuard corpus GPL-3.0.
-#
-# NOTE: the upstream ClearURLs Rules are copyleft (LGPL-3.0); this crate ships
-# only the parser, not that data. Download it and point at it yourself if you
-# want it.
+# only `mail-beacon`.
 # Patterns using regex features unsupported by Rust's linear-time engine are
 # skipped individually; the rest of the pack still loads.
 rule_packs = [

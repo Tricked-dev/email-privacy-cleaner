@@ -43,7 +43,7 @@ rules/builtin.json                 built-in rules
 tests/fixtures/                    synthetic message fixtures
 ```
 
-The detailed rule-engine contract, supported third-party formats, limits, and
+The detailed rule-engine contract, supported external formats, limits, and
 rule-engine rationale live in
 [`RULESET_REFACTOR_PLAN.md`](RULESET_REFACTOR_PLAN.md). Keep design detail there
 instead of duplicating it in general project files.
@@ -186,7 +186,7 @@ that a default-branch push refreshed `latest` without checking an actual Docker
 workflow run. Tags and registry publication are maintainer actions; a local
 build or test does not establish that a release was published.
 
-Before a release, maintainers should verify the version and license metadata in
+Before a release, maintainers should verify the version and package metadata in
 [`Cargo.toml`](Cargo.toml), run the complete Rust and Nix gates, review
 user-visible changes in the README, and confirm the resulting workflow and
 registry state. Do not commit staged binaries produced for the container

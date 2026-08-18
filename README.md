@@ -254,9 +254,9 @@ forwards, so they are intended for deliberate debugging only.
 
 ## External rule packs
 
-The binary includes the original built-in ruleset from
-[`rules/builtin.json`](rules/builtin.json). It is always present; external
-packs add to it and do not replace it.
+The binary includes only a small, manually maintained built-in ruleset from
+[`rules/builtin.json`](rules/builtin.json). It is always present; optional
+external packs add to it and do not replace it.
 
 ### Complete supported list
 
@@ -401,8 +401,9 @@ Nix fetches the content by hash during the build and the daemon reads it from
 the store at startup. This composes with either `settings` or `configFile` and
 does not require rule-pack network access from the service.
 
-External data is not bundled. Review its behavior and license before use; see
-[Licensing](#licensing).
+Only the small manually maintained list in `rules/builtin.json` is bundled.
+External lists are optional and supported through the configured external-pack
+formats, local paths, HTTPS sources, or Nix-prefetched store paths.
 
 ## Running the milter
 
@@ -576,16 +577,6 @@ pack fetching and network redirect resolution do not.
   an unsafe third-party rule pack safe.
 - This is a tracker sanitizer, not an antivirus, spam filter, phishing detector,
   or guarantee that a destination is trustworthy.
-
-## Licensing
-
-The project code and built-in rules are available under either the
-[MIT license](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE).
-
-Third-party rule data is separate and is not bundled. ClearURLs Rules data is
-LGPL-3.0, Brave list data is MPL-2.0, and the AdGuard corpus is GPL-3.0. Loading
-an external pack does not relicense that data; review and comply with its own
-terms when distributing or deploying it.
 
 ## Contributing and design
 

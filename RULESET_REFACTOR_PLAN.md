@@ -135,9 +135,10 @@ blocked by external infrastructure.
   regression is justified.
 - Update README, config example, CLI help, module documentation, and
   `nix/module.nix`.
-- Keep external packs optional and external. Name upstream licenses accurately:
-  ClearURLs Rules LGPL-3.0, Brave lists MPL-2.0, and AdGuard corpus GPL-3.0.
-  Keep only original project data in `rules/builtin.json`.
+- Keep the binary's built-in list small and manually maintained in
+  `rules/builtin.json`. Keep external packs optional, and support them through
+  the configured external-pack formats, local paths, HTTPS sources, and
+  Nix-prefetched store paths.
 
 ## Acceptance gates
 
@@ -602,8 +603,9 @@ brittle hard gates.
   targets.
 - README, config example, CLI help, module documentation, and Nix module
   describe the supported sources, limits, purpose hints, and diagnostics.
-- External licenses are named as LGPL-3.0, MPL-2.0, and GPL-3.0.
-- Only original project data remains in builtin.json.
+- The binary contains only the small manually maintained built-in list;
+  external packs remain optional and are loaded through the supported source
+  configuration paths.
 
 ## Final performance and CI gates
 
