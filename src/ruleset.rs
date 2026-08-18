@@ -13,7 +13,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use percent_encoding::percent_decode_str;
-use regex::{Regex, RegexSet};
+use regex::{Regex, RegexSet, SetMatches};
 use regex_syntax::hir::{Class, Hir, HirKind};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -29,6 +29,8 @@ const MAX_GENERATED_REGEX_BYTES: usize = 64 * 1024;
 const MAX_REGEX_CHUNK_PATTERNS: usize = 256;
 const MAX_REGEX_CHUNK_BYTES: usize = 128 * 1024;
 const MAX_DIAGNOSTIC_SAMPLES: usize = 16;
+const GOOGLE_SEARCH_REDIRECT_PATTERN: &str =
+    r"^https?://(?:[a-z0-9-]+\.)*?google(?:\.[a-z]{2,}){1,}/url\?.*?(?:url|q)=(https?[^&]+)";
 
 /// Supported external rule-pack formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -450,32 +452,97 @@ struct Provider {
     name: String,
     global: bool,
     complete: bool,
-    url_pattern: Regex,
-    exceptions: Vec<Regex>,
+    url_pattern: ProviderMatcher,
+    exceptions: Box<[IndexedRegex]>,
+    scope: ScopeId,
+}
+
+#[derive(Debug, Clone)]
+enum ProviderMatcher {
+    Direct {
+        literals: Box<[Box<str>]>,
+        subdomains: bool,
+        match_index: usize,
+    },
+    Regex(IndexedRegex),
+}
+
+impl ProviderMatcher {
+    fn matched(&self, matches: &ProviderMatches) -> bool {
+        match self {
+            Self::Direct { match_index, .. } => matches.direct[*match_index],
+            Self::Regex(regex) => regex.matched(&matches.regex),
+        }
+    }
+}
+
+struct ProviderMatches {
+    regex: Vec<SetMatches>,
+    direct: Vec<bool>,
+}
+
+#[derive(Debug, Default)]
+struct DirectProviderIndex {
+    anchored: DirectProviderTrie,
+    subdomains: DirectProviderTrie,
+}
+
+#[derive(Debug, Default)]
+struct DirectProviderTrie {
+    nodes: Box<[DirectProviderTrieNode]>,
+}
+
+#[derive(Debug)]
+struct DirectProviderTrieNode {
+    edges: Box<[(u8, usize)]>,
+    matches: Box<[usize]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedRegex {
+    chunk: usize,
+    index: usize,
+}
+
+impl IndexedRegex {
+    fn matched(self, matches: &[SetMatches]) -> bool {
+        matches
+            .get(self.chunk)
+            .is_some_and(|matches| matches.matched(self.index))
+    }
 }
 
 #[derive(Debug, Clone)]
 enum CompiledScope {
     Any,
     UrlRegex(Regex),
+    ProviderPattern(ProviderMatcher),
     UrlGlob {
-        regex: Regex,
+        pattern: Box<str>,
         host_suffix: Option<Box<str>>,
     },
     AdGuardTarget {
-        regex: Regex,
+        pattern: Box<str>,
+        match_case: bool,
         domains: Box<[Box<str>]>,
         host_suffix: Option<Box<str>>,
     },
 }
 
 impl CompiledScope {
-    fn matches(&self, raw_url: &str, parsed: &Url) -> bool {
+    fn matches(&self, raw_url: &str, parsed: &Url, provider_matches: &ProviderMatches) -> bool {
         match self {
             Self::Any => true,
-            Self::UrlRegex(re) | Self::UrlGlob { regex: re, .. } => re.is_match(raw_url),
-            Self::AdGuardTarget { regex, domains, .. } => {
-                regex.is_match(raw_url)
+            Self::UrlRegex(re) => re.is_match(raw_url),
+            Self::ProviderPattern(pattern) => pattern.matched(provider_matches),
+            Self::UrlGlob { pattern, .. } => glob_matches(pattern, raw_url),
+            Self::AdGuardTarget {
+                pattern,
+                match_case,
+                domains,
+                ..
+            } => {
+                adguard_target_matches(pattern, raw_url, *match_case)
                     && (domains.is_empty()
                         || parsed.host_str().is_some_and(|host| {
                             domains
@@ -508,7 +575,7 @@ impl CompiledScope {
                     }
                 }
             }
-            Self::Any | Self::UrlRegex(_) => {}
+            Self::Any | Self::UrlRegex(_) | Self::ProviderPattern(_) => {}
         }
     }
 }
@@ -599,6 +666,9 @@ enum RedirectExtractor {
     ClearUrls {
         regex: Regex,
     },
+    ClearUrlsGoogle {
+        regex: Regex,
+    },
     QueryParam {
         names: Box<[Box<str>]>,
         decode: DecodeMode,
@@ -615,7 +685,6 @@ enum RedirectExtractor {
 struct CompiledBeaconRule {
     include: Box<[ScopeId]>,
     exclude: Box<[ScopeId]>,
-    raw_regex: Option<Regex>,
 }
 
 #[derive(Debug, Clone)]
@@ -631,14 +700,27 @@ struct ScopeIndex {
     generic: Vec<usize>,
 }
 
+#[derive(Debug, Default)]
+struct RedirectIndex {
+    global: Box<[usize]>,
+    suffix: HashMap<Box<str>, Box<[usize]>>,
+    provider: HashMap<usize, Box<[usize]>>,
+    provider_regex: Box<[(IndexedRegex, Box<[usize]>)]>,
+    generic: Box<[usize]>,
+}
+
 #[derive(Debug)]
 struct RuleStore {
     providers: Box<[Provider]>,
+    provider_patterns: Box<[RegexSetChunk]>,
+    provider_exceptions: Box<[RegexSetChunk]>,
+    direct_provider_index: DirectProviderIndex,
     scopes: Box<[CompiledScope]>,
     groups: Box<[RuleGroup]>,
     actions: Box<[ParamAction]>,
     regex_chunks: Box<[RegexSetChunk]>,
     scope_index: ScopeIndex,
+    redirect_index: RedirectIndex,
     redirects: Box<[CompiledRedirectRule]>,
     beacons: Box<[CompiledBeaconRule]>,
     raw_rules: Box<[CompiledRawRule]>,
@@ -964,6 +1046,7 @@ impl Ruleset {
     /// Build the candidate group set once for one URL.  Query-parameter loops
     /// should retain this context instead of rescanning provider scopes.
     pub fn context_for<'a>(&'a self, raw_url: &'a str, parsed_url: &'a Url) -> UrlContext<'a> {
+        let provider_matches = match_provider_patterns(&self.store, raw_url);
         let mut candidates = BTreeSet::new();
         candidates.extend(self.store.scope_index.global.iter().copied());
         candidates.extend(self.store.scope_index.generic.iter().copied());
@@ -989,6 +1072,7 @@ impl Ruleset {
                     &group.exclude_scopes,
                     raw_url,
                     parsed_url,
+                    &provider_matches,
                 )
             })
             .collect();
@@ -996,17 +1080,18 @@ impl Ruleset {
         let mut active = active;
         active.sort_by_key(|group_id| self.store.groups[*group_id].order);
 
+        let exception_matches = match_regex_chunks(&self.store.provider_exceptions, raw_url);
         let clearurls_exceptions = self
             .store
             .providers
             .iter()
             .enumerate()
             .filter(|(_, provider)| {
-                provider.url_pattern.is_match(raw_url)
+                provider.url_pattern.matched(&provider_matches)
                     && provider
                         .exceptions
                         .iter()
-                        .any(|exception| exception.is_match(raw_url))
+                        .any(|exception| exception.matched(&exception_matches))
             })
             .map(|(id, _)| id)
             .collect();
@@ -1082,10 +1167,11 @@ impl Ruleset {
 
     /// The first non-global provider matching this URL.
     pub fn detect_provider(&self, url: &str) -> Option<&str> {
+        let matches = match_provider_patterns(&self.store, url);
         self.store
             .providers
             .iter()
-            .find(|provider| !provider.global && provider.url_pattern.is_match(url))
+            .find(|provider| !provider.global && provider.url_pattern.matched(&matches))
             .map(|provider| provider.name.as_str())
     }
 
@@ -1101,13 +1187,46 @@ impl Ruleset {
     /// needed by the caller's format-specific safety policy.
     pub fn redirect_target_with_origin(&self, url: &str) -> Option<RedirectTarget> {
         let parsed = Url::parse(url).ok()?;
-        for rule in self.store.redirects.iter() {
+        let provider_matches = match_provider_patterns(&self.store, url);
+        let mut candidates = Vec::new();
+        candidates.extend(self.store.redirect_index.global.iter().copied());
+        candidates.extend(self.store.redirect_index.generic.iter().copied());
+        for (provider_id, matched) in provider_matches.direct.iter().copied().enumerate() {
+            if matched {
+                if let Some(redirects) = self.store.redirect_index.provider.get(&provider_id) {
+                    candidates.extend(redirects.iter().copied());
+                }
+            }
+        }
+        for (pattern, redirects) in self.store.redirect_index.provider_regex.iter() {
+            if pattern.matched(&provider_matches.regex) {
+                candidates.extend(redirects.iter().copied());
+            }
+        }
+        if let Some(host) = parsed.host_str() {
+            let mut suffix = host.trim_end_matches('.');
+            loop {
+                if let Some(redirects) = self.store.redirect_index.suffix.get(suffix) {
+                    candidates.extend(redirects.iter().copied());
+                }
+                let Some(dot) = suffix.find('.') else {
+                    break;
+                };
+                suffix = &suffix[dot + 1..];
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        for rule_id in candidates {
+            let rule = &self.store.redirects[rule_id];
             if !scopes_match(
                 &self.store.scopes,
                 &rule.include,
                 &rule.exclude,
                 url,
                 &parsed,
+                &provider_matches,
             ) {
                 continue;
             }
@@ -1125,13 +1244,21 @@ impl Ruleset {
     /// The normal URL/message cleaning path deliberately does not call this.
     pub fn apply_raw_rules(&self, url: &str) -> (String, bool) {
         let parsed = Url::parse(url).ok();
+        let provider_matches = match_provider_patterns(&self.store, url);
         let mut current = url.to_string();
         let mut changed = false;
         for rule in self.store.raw_rules.iter() {
             let Some(parsed) = parsed.as_ref() else {
                 break;
             };
-            if !scopes_match(&self.store.scopes, &rule.include, &[], url, parsed) {
+            if !scopes_match(
+                &self.store.scopes,
+                &rule.include,
+                &[],
+                url,
+                parsed,
+                &provider_matches,
+            ) {
                 continue;
             }
             if rule.regex.is_match(&current) {
@@ -1146,11 +1273,12 @@ impl Ruleset {
     /// beacon rule.  This method is only a classifier; HTML call sites decide
     /// whether an image/CSS context is safe to neutralize.
     pub fn is_complete_block(&self, url: &str) -> bool {
+        let matches = match_provider_patterns(&self.store, url);
         if self
             .store
             .providers
             .iter()
-            .any(|provider| provider.complete && provider.url_pattern.is_match(url))
+            .any(|provider| provider.complete && provider.url_pattern.matched(&matches))
         {
             return true;
         }
@@ -1161,32 +1289,49 @@ impl Ruleset {
     /// URL and, when available, its parsed host.
     pub fn is_beacon_url(&self, url: &str, host: Option<&str>) -> bool {
         let parsed = Url::parse(url).ok();
-        self.store.beacons.iter().any(|rule| {
-            if let Some(parsed) = parsed.as_ref() {
-                if scopes_match(
+        let provider_matches = match_provider_patterns(&self.store, url);
+        if let Some(parsed) = parsed.as_ref() {
+            if self.store.beacons.iter().any(|rule| {
+                scopes_match(
                     &self.store.scopes,
                     &rule.include,
                     &rule.exclude,
                     url,
                     parsed,
-                ) {
-                    return true;
-                }
-                // A parsed URL that did not satisfy the target scope is an
-                // ordinary direct URL, not an encoded proxy payload.  Do not
-                // let a broad raw fallback (for example `*`) turn a scoped
-                // image rule into a global beacon rule.
-                if !contains_embedded_url(url) {
-                    return false;
-                }
+                    &provider_matches,
+                )
+            }) {
+                return true;
             }
-            let Some(raw_regex) = &rule.raw_regex else {
+            // A parsed URL that did not satisfy any target scope is an
+            // ordinary direct URL, not an encoded proxy payload. Do not let a
+            // broad raw fallback (for example `*`) make it a global beacon.
+            if !contains_embedded_url(url) {
                 return false;
-            };
-            raw_regex.is_match(url)
-                || host.map(|host| raw_regex.is_match(host)).unwrap_or(false)
-                || (contains_embedded_url(url) && regex_matches_embedded_url(raw_regex, url))
-        })
+            }
+        }
+
+        if scopes_match_embedded_beacon(&self.store, url) {
+            return true;
+        }
+
+        // Preserve the host-only fallback for callers with a malformed raw
+        // URL without compiling a second copy of every beacon expression.
+        host.and_then(|host| Url::parse(&format!("https://{host}/")).ok())
+            .map(|parsed| {
+                let provider_matches = match_provider_patterns(&self.store, parsed.as_str());
+                self.store.beacons.iter().any(|rule| {
+                    scopes_match(
+                        &self.store.scopes,
+                        &rule.include,
+                        &rule.exclude,
+                        parsed.as_str(),
+                        &parsed,
+                        &provider_matches,
+                    )
+                })
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -1352,6 +1497,92 @@ fn compile_store(
     let mut skipped = 0usize;
     let mut scopes = Vec::<CompiledScope>::new();
     let mut scope_ids = HashMap::<ScopeSpec, ScopeId>::new();
+
+    let mut pending_providers = Vec::new();
+    let mut provider_patterns = Vec::new();
+    let mut provider_exception_patterns = Vec::new();
+    for source in sources {
+        for provider in &source.providers {
+            if provider_disabled(disabled, &provider.name) {
+                continue;
+            }
+            let direct = compile_provider_direct_pattern(&provider.url_pattern);
+            let pattern_index = if direct.is_none() {
+                let index = provider_patterns.len();
+                provider_patterns.push(format!("(?i){}", provider.url_pattern));
+                Some(index)
+            } else {
+                None
+            };
+            let exception_start = provider_exception_patterns.len();
+            provider_exception_patterns.extend(
+                provider
+                    .exceptions
+                    .iter()
+                    .map(|pattern| format!("(?i){pattern}")),
+            );
+            let exception_end = provider_exception_patterns.len();
+            pending_providers.push((
+                source,
+                provider,
+                direct,
+                pattern_index,
+                exception_start..exception_end,
+            ));
+        }
+    }
+    let (provider_pattern_chunks, provider_pattern_refs, failed_provider_patterns) =
+        compile_indexed_regexes(provider_patterns);
+    skipped += failed_provider_patterns;
+    let (provider_exception_chunks, provider_exception_refs, _) =
+        compile_indexed_regexes(provider_exception_patterns);
+
+    let mut providers = Vec::<Provider>::with_capacity(pending_providers.len());
+    let mut provider_ids = HashMap::<(&str, &str), usize>::new();
+    for (source, provider, direct, pattern_index, exception_range) in pending_providers {
+        let mut url_pattern = if let Some(direct) = direct {
+            direct
+        } else {
+            let Some(pattern_index) = pattern_index else {
+                continue;
+            };
+            let Some(indexed) = provider_pattern_refs[pattern_index] else {
+                continue;
+            };
+            ProviderMatcher::Regex(indexed)
+        };
+        let provider_id = providers.len();
+        if let ProviderMatcher::Direct { match_index, .. } = &mut url_pattern {
+            *match_index = provider_id;
+        }
+        let provider_scope =
+            ScopeSpec::UrlRegex(format!("(?i){}", provider.url_pattern).into_boxed_str());
+        let scope = if let Some(scope) = scope_ids.get(&provider_scope).copied() {
+            scope
+        } else {
+            let scope = scopes.len();
+            scopes.push(CompiledScope::ProviderPattern(url_pattern.clone()));
+            scope_ids.insert(provider_scope, scope);
+            scope
+        };
+        let exceptions = exception_range
+            .filter_map(|index| provider_exception_refs[index])
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        providers.push(Provider {
+            name: provider.name.to_string(),
+            global: provider.global,
+            complete: provider.complete,
+            url_pattern,
+            exceptions,
+            scope,
+        });
+        provider_ids.insert(
+            (source.source.as_str(), provider.name.as_ref()),
+            provider_id,
+        );
+    }
+    let direct_provider_index = build_direct_provider_index(&providers);
     let mut intern_scope = |spec: &ScopeSpec| -> Option<ScopeId> {
         if let Some(id) = scope_ids.get(spec).copied() {
             return Some(id);
@@ -1363,37 +1594,6 @@ fn compile_store(
         Some(id)
     };
 
-    let mut providers = Vec::<Provider>::new();
-    let mut provider_ids = HashMap::<String, usize>::new();
-    for source in sources {
-        for provider in &source.providers {
-            if disabled.contains(&provider.name.to_ascii_lowercase()) {
-                continue;
-            }
-            let Some(url_pattern) = compile_url_pattern(&provider.url_pattern) else {
-                skipped += 1;
-                continue;
-            };
-            let exceptions = provider
-                .exceptions
-                .iter()
-                .filter_map(|pattern| compile_url_pattern(pattern))
-                .collect::<Vec<_>>();
-            let provider_id = providers.len();
-            providers.push(Provider {
-                name: provider.name.to_string(),
-                global: provider.global,
-                complete: provider.complete,
-                url_pattern,
-                exceptions,
-            });
-            provider_ids.insert(
-                clearurls_provider_identity(&source.source, &provider.name),
-                provider_id,
-            );
-        }
-    }
-
     let mut pending = Vec::<PendingParamAction>::new();
     let mut parameter_order = 0u32;
     let mut seen = HashMap::<ParamDedupKey, usize>::new();
@@ -1403,7 +1603,7 @@ fn compile_store(
             if rule
                 .provider
                 .as_deref()
-                .map(|provider| disabled.contains(&provider.to_ascii_lowercase()))
+                .map(|provider| provider_disabled(disabled, provider))
                 .unwrap_or(false)
             {
                 continue;
@@ -1414,7 +1614,7 @@ fn compile_store(
                     continue;
                 };
                 let Some(provider_id) = provider_ids
-                    .get(&clearurls_provider_identity(&source.source, provider))
+                    .get(&(source.source.as_str(), provider))
                     .copied()
                 else {
                     // A positive rule cannot remain active when its provider
@@ -1430,6 +1630,14 @@ fn compile_store(
             };
             let legacy_builtin_global_carveout =
                 rule.source == SourceKind::ClearUrls && rule.global && source.source == "builtin";
+            let Some(include) = intern_scopes(&mut intern_scope, &rule.include) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(exclude) = intern_scopes(&mut intern_scope, &rule.exclude) else {
+                skipped += 1;
+                continue;
+            };
             let key = ParamDedupKey {
                 global: rule.global,
                 referral: rule.referral,
@@ -1437,8 +1645,8 @@ fn compile_store(
                 exception_all: rule.exception_all,
                 legacy_builtin_global_carveout,
                 matcher: rule.matcher.clone(),
-                include: rule.include.clone(),
-                exclude: rule.exclude.clone(),
+                include: include.clone(),
+                exclude: exclude.clone(),
             };
             if let Some(existing_index) = seen.get(&key).copied() {
                 let existing = &mut pending[existing_index];
@@ -1450,14 +1658,6 @@ fn compile_store(
                 *duplicates.entry(rule.report_index).or_default() += 1;
                 continue;
             }
-            let Some(include) = intern_scopes(&mut intern_scope, &rule.include) else {
-                skipped += 1;
-                continue;
-            };
-            let Some(exclude) = intern_scopes(&mut intern_scope, &rule.exclude) else {
-                skipped += 1;
-                continue;
-            };
             let pending_index = pending.len();
             seen.insert(key, pending_index);
             pending.push(PendingParamAction {
@@ -1513,14 +1713,14 @@ fn compile_store(
         });
     }
 
-    let mut redirects = Vec::new();
+    let mut pending_redirects = Vec::new();
     let mut redirect_order = 0u32;
     for source in sources {
         for rule in &source.redirects {
             if rule
                 .provider
                 .as_deref()
-                .map(|provider| disabled.contains(&provider.to_ascii_lowercase()))
+                .map(|provider| provider_disabled(disabled, provider))
                 .unwrap_or(false)
             {
                 continue;
@@ -1533,14 +1733,10 @@ fn compile_store(
                 skipped += 1;
                 continue;
             };
-            let Some(extractor) = compile_redirect_extractor(&rule.extractor) else {
-                skipped += 1;
-                continue;
-            };
-            redirects.push(CompiledRedirectRule {
+            pending_redirects.push(PendingRedirectCompile {
                 include,
                 exclude,
-                extractor,
+                extractor: rule.extractor.clone(),
                 origin: if source.format == RulePackFormat::BraveDebounce {
                     RedirectOrigin::Brave
                 } else {
@@ -1550,6 +1746,21 @@ fn compile_store(
             });
             redirect_order = redirect_order.saturating_add(1);
         }
+    }
+    let compiled_redirects = compile_redirect_extractors(&pending_redirects);
+    let mut redirects = Vec::with_capacity(pending_redirects.len());
+    for (pending, extractor) in pending_redirects.into_iter().zip(compiled_redirects) {
+        let Some(extractor) = extractor else {
+            skipped += 1;
+            continue;
+        };
+        redirects.push(CompiledRedirectRule {
+            include: pending.include,
+            exclude: pending.exclude,
+            extractor,
+            origin: pending.origin,
+            order: pending.order,
+        });
     }
     redirects.sort_by_key(|rule| rule.order);
 
@@ -1564,28 +1775,15 @@ fn compile_store(
                 skipped += 1;
                 continue;
             };
-            let raw_regex = rule
-                .raw_pattern
-                .as_deref()
-                .and_then(compile_beacon_raw_regex);
-            beacons.push(CompiledBeaconRule {
-                include,
-                exclude,
-                raw_regex,
-            });
+            beacons.push(CompiledBeaconRule { include, exclude });
         }
     }
     for provider in providers.iter() {
         if provider.complete {
-            let include = intern_scope(&ScopeSpec::UrlRegex(
-                format_regex_for_scope(provider.url_pattern.as_str()).into_boxed_str(),
-            ))
-            .into_iter()
-            .collect::<Box<[_]>>();
+            let include = Box::new([provider.scope]);
             beacons.push(CompiledBeaconRule {
                 include,
                 exclude: Box::new([]),
-                raw_regex: Some(provider.url_pattern.clone()),
             });
         }
     }
@@ -1593,7 +1791,7 @@ fn compile_store(
     let mut raw_rules = Vec::new();
     for source in sources {
         for rule in &source.raw_rules {
-            if disabled.contains(&rule.provider.to_ascii_lowercase()) {
+            if provider_disabled(disabled, &rule.provider) {
                 continue;
             }
             let Some(include) = intern_scopes(&mut intern_scope, &rule.include) else {
@@ -1609,6 +1807,7 @@ fn compile_store(
     }
 
     let scope_index = build_scope_index(&scopes, &groups);
+    let redirect_index = build_redirect_index(&scopes, &redirects);
     let stats = RuleStoreStats {
         scopes: scopes.len(),
         groups: groups.len(),
@@ -1625,11 +1824,15 @@ fn compile_store(
     (
         RuleStore {
             providers: providers.into_boxed_slice(),
+            provider_patterns: provider_pattern_chunks.into_boxed_slice(),
+            provider_exceptions: provider_exception_chunks.into_boxed_slice(),
+            direct_provider_index,
             scopes: scopes.into_boxed_slice(),
             groups: groups.into_boxed_slice(),
             actions: actions.into_boxed_slice(),
             regex_chunks: regex_chunks.into_boxed_slice(),
             scope_index,
+            redirect_index,
             redirects: redirects.into_boxed_slice(),
             beacons: beacons.into_boxed_slice(),
             raw_rules: raw_rules.into_boxed_slice(),
@@ -1640,8 +1843,121 @@ fn compile_store(
     )
 }
 
-fn clearurls_provider_identity(source: &str, provider: &str) -> String {
-    format!("{source}\u{1f}{provider}")
+fn provider_disabled(disabled: &HashSet<String>, provider: &str) -> bool {
+    !disabled.is_empty()
+        && (disabled.contains(provider) || disabled.contains(&provider.to_ascii_lowercase()))
+}
+
+fn compile_provider_direct_pattern(pattern: &str) -> Option<ProviderMatcher> {
+    const PREFIXES: [(&str, bool); 4] = [
+        (r"^https?://(?:[a-z0-9-]+\.)*?", true),
+        (r"^https?:\/\/(?:[a-z0-9-]+\.)*?", true),
+        (r"^https?://", false),
+        (r"^https?:\/\/", false),
+    ];
+    let (rest, subdomains) = PREFIXES.iter().find_map(|(prefix, subdomains)| {
+        pattern.strip_prefix(prefix).map(|rest| (rest, *subdomains))
+    })?;
+    let literals = if let Some(literal) = unescape_provider_literal(rest) {
+        vec![literal]
+    } else {
+        let hir = regex_syntax::parse(rest).ok()?;
+        let values = expand_hir(&hir, MAX_LITERAL_EXPANSION)?;
+        if values.iter().any(|literal| !literal.is_ascii()) {
+            return None;
+        }
+        values
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect::<Vec<_>>()
+    };
+    if literals.is_empty() {
+        return None;
+    }
+    Some(ProviderMatcher::Direct {
+        literals: literals.into_boxed_slice(),
+        subdomains,
+        match_index: usize::MAX,
+    })
+}
+
+fn unescape_provider_literal(pattern: &str) -> Option<Box<str>> {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut bytes = pattern.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            let escaped = bytes.next()?;
+            if escaped.is_ascii_alphanumeric() {
+                return None;
+            }
+            literal.push(escaped as char);
+        } else if is_regex_meta_byte(byte) {
+            return None;
+        } else if byte.is_ascii() {
+            literal.push(byte as char);
+        } else {
+            return None;
+        }
+    }
+    Some(literal.into_boxed_str())
+}
+
+fn provider_direct_matches(literal: &str, subdomains: bool, value: &str) -> bool {
+    let tail = ["https://", "http://"].into_iter().find_map(|scheme| {
+        let prefix = value.get(..scheme.len())?;
+        starts_with_unicode_case(prefix, scheme).then_some(&value[scheme.len()..])
+    });
+    let Some(tail) = tail else {
+        return false;
+    };
+    if starts_with_unicode_case(tail, literal) {
+        return true;
+    }
+    if !subdomains {
+        return false;
+    }
+
+    let mut label_start = 0;
+    for (offset, character) in tail.char_indices() {
+        if character == '.' {
+            if offset == label_start {
+                return false;
+            }
+            let remainder = &tail[offset + 1..];
+            if starts_with_unicode_case(remainder, literal) {
+                return true;
+            }
+            label_start = offset + 1;
+        } else if !(character.is_ascii_digit()
+            || character == '-'
+            || folds_to_ascii_letter(character))
+        {
+            return false;
+        }
+    }
+    false
+}
+
+fn starts_with_unicode_case(value: &str, literal: &str) -> bool {
+    let mut value = value.chars();
+    for expected in literal.chars() {
+        let Some(actual) = value.next() else {
+            return false;
+        };
+        if !chars_eq_ignore_case(expected, actual) {
+            return false;
+        }
+    }
+    true
+}
+
+fn folds_to_ascii_letter(character: char) -> bool {
+    character
+        .to_lowercase()
+        .all(|folded| folded.is_ascii_alphabetic())
+        || character
+            .to_uppercase()
+            .all(|folded| folded.is_ascii_alphabetic())
 }
 
 #[derive(Debug, Clone)]
@@ -1659,6 +1975,15 @@ struct PendingParamAction {
     order: u32,
 }
 
+#[derive(Debug)]
+struct PendingRedirectCompile {
+    include: Box<[ScopeId]>,
+    exclude: Box<[ScopeId]>,
+    extractor: RedirectExtractorIr,
+    origin: RedirectOrigin,
+    order: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ParamDedupKey {
     global: bool,
@@ -1667,11 +1992,186 @@ struct ParamDedupKey {
     exception_all: bool,
     legacy_builtin_global_carveout: bool,
     matcher: ParamMatcherSpec,
-    include: Vec<ScopeSpec>,
-    exclude: Vec<ScopeSpec>,
+    include: Box<[ScopeId]>,
+    exclude: Box<[ScopeId]>,
 }
 
-type RegexCompileResult = (Vec<RegexSetChunk>, Vec<Option<(usize, usize)>>, usize);
+type RegexCompileResult = (Vec<RegexSetChunk>, Vec<Option<IndexedRegex>>, usize);
+
+fn compile_indexed_regexes(
+    patterns: Vec<String>,
+) -> (Vec<RegexSetChunk>, Vec<Option<IndexedRegex>>, usize) {
+    let entries = patterns.into_iter().enumerate().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut refs = vec![None; entries.len()];
+    let mut failed = 0;
+    let mut batch_start = 0;
+    let mut batch_bytes = 0usize;
+    for (index, (_, pattern)) in entries.iter().enumerate() {
+        let would_exceed = batch_start < index
+            && batch_bytes.saturating_add(pattern.len()) > MAX_REGEX_CHUNK_BYTES;
+        if would_exceed || index.saturating_sub(batch_start) >= MAX_REGEX_CHUNK_PATTERNS {
+            compile_regex_batch(
+                &entries[batch_start..index],
+                &mut chunks,
+                &mut refs,
+                &mut failed,
+            );
+            batch_start = index;
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes.saturating_add(pattern.len());
+    }
+    if batch_start < entries.len() {
+        compile_regex_batch(&entries[batch_start..], &mut chunks, &mut refs, &mut failed);
+    }
+    (chunks, refs, failed)
+}
+
+fn match_regex_chunks(chunks: &[RegexSetChunk], value: &str) -> Vec<SetMatches> {
+    chunks
+        .iter()
+        .map(|chunk| chunk.set.matches(value))
+        .collect()
+}
+
+fn match_provider_patterns(store: &RuleStore, value: &str) -> ProviderMatches {
+    let regex = match_regex_chunks(&store.provider_patterns, value);
+    let mut direct = vec![false; store.providers.len()];
+    if value.is_ascii() {
+        store.direct_provider_index.match_ascii(value, &mut direct);
+    } else {
+        for provider in store.providers.iter() {
+            if let ProviderMatcher::Direct {
+                literals,
+                subdomains,
+                match_index,
+            } = &provider.url_pattern
+            {
+                direct[*match_index] = literals
+                    .iter()
+                    .any(|literal| provider_direct_matches(literal, *subdomains, value));
+            }
+        }
+    }
+    ProviderMatches { regex, direct }
+}
+
+fn build_direct_provider_index(providers: &[Provider]) -> DirectProviderIndex {
+    let mut anchored = Vec::new();
+    let mut subdomains = Vec::new();
+    for provider in providers {
+        let ProviderMatcher::Direct {
+            literals,
+            subdomains: accepts_subdomains,
+            match_index,
+        } = &provider.url_pattern
+        else {
+            continue;
+        };
+        for literal in literals {
+            if *accepts_subdomains {
+                subdomains.push((literal.as_ref(), *match_index));
+            } else {
+                anchored.push((literal.as_ref(), *match_index));
+            }
+        }
+    }
+    DirectProviderIndex {
+        anchored: DirectProviderTrie::new(&anchored),
+        subdomains: DirectProviderTrie::new(&subdomains),
+    }
+}
+
+impl DirectProviderIndex {
+    fn match_ascii(&self, value: &str, matches: &mut [bool]) {
+        let Some(tail) = ["https://", "http://"].into_iter().find_map(|scheme| {
+            let prefix = value.get(..scheme.len())?;
+            prefix
+                .eq_ignore_ascii_case(scheme)
+                .then_some(&value[scheme.len()..])
+        }) else {
+            return;
+        };
+        self.anchored.match_at(tail, 0, matches);
+        let mut label_start = 0;
+        self.subdomains.match_at(tail, 0, matches);
+        for (offset, byte) in tail.bytes().enumerate() {
+            if byte == b'.' {
+                if offset == label_start {
+                    break;
+                }
+                let start = offset + 1;
+                self.subdomains.match_at(tail, start, matches);
+                label_start = start;
+            } else if !(byte.is_ascii_alphanumeric() || byte == b'-') {
+                break;
+            }
+        }
+    }
+}
+
+impl DirectProviderTrie {
+    fn new(patterns: &[(&str, usize)]) -> Self {
+        #[derive(Default)]
+        struct BuildNode {
+            edges: Vec<(u8, usize)>,
+            matches: Vec<usize>,
+        }
+
+        let mut nodes = vec![BuildNode::default()];
+        for (pattern, provider_id) in patterns {
+            let mut node = 0;
+            for byte in pattern.bytes().map(|byte| byte.to_ascii_lowercase()) {
+                let next = if let Some(next) = nodes[node]
+                    .edges
+                    .iter()
+                    .find_map(|(edge, next)| (*edge == byte).then_some(*next))
+                {
+                    next
+                } else {
+                    let next = nodes.len();
+                    nodes.push(BuildNode::default());
+                    nodes[node].edges.push((byte, next));
+                    next
+                };
+                node = next;
+            }
+            nodes[node].matches.push(*provider_id);
+        }
+        Self {
+            nodes: nodes
+                .into_iter()
+                .map(|mut node| {
+                    node.edges.sort_unstable_by_key(|(edge, _)| *edge);
+                    DirectProviderTrieNode {
+                        edges: node.edges.into_boxed_slice(),
+                        matches: node.matches.into_boxed_slice(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn match_at(&self, value: &str, start: usize, matches: &mut [bool]) {
+        let mut node = 0;
+        for provider_id in self.nodes[node].matches.iter() {
+            matches[*provider_id] = true;
+        }
+        for byte in value[start..].bytes().map(|byte| byte.to_ascii_lowercase()) {
+            let Ok(edge) = self.nodes[node]
+                .edges
+                .binary_search_by_key(&byte, |(edge, _)| *edge)
+            else {
+                return;
+            };
+            node = self.nodes[node].edges[edge].1;
+            for provider_id in self.nodes[node].matches.iter() {
+                matches[*provider_id] = true;
+            }
+        }
+    }
+}
 
 fn compile_regex_chunks(pending: &[PendingParamAction]) -> RegexCompileResult {
     let mut groups: BTreeMap<(ParamSubject, bool, bool), Vec<(usize, String)>> = BTreeMap::new();
@@ -1736,7 +2236,7 @@ fn compile_regex_chunks(pending: &[PendingParamAction]) -> RegexCompileResult {
 fn compile_regex_batch(
     entries: &[(usize, String)],
     chunks: &mut Vec<RegexSetChunk>,
-    refs: &mut [Option<(usize, usize)>],
+    refs: &mut [Option<IndexedRegex>],
     failed: &mut usize,
 ) {
     let patterns: Vec<&str> = entries
@@ -1748,7 +2248,7 @@ fn compile_regex_batch(
             let chunk = chunks.len();
             chunks.push(RegexSetChunk { set });
             for (index, (pending, _)) in entries.iter().enumerate() {
-                refs[*pending] = Some((chunk, index));
+                refs[*pending] = Some(IndexedRegex { chunk, index });
             }
         }
         Err(_) if entries.len() > 1 => {
@@ -1764,7 +2264,7 @@ fn compile_regex_batch(
 
 fn compile_matcher(
     spec: &ParamMatcherSpec,
-    regex_ref: Option<(usize, usize)>,
+    regex_ref: Option<IndexedRegex>,
 ) -> Option<CompiledParamMatcher> {
     let (kind, subject, case_sensitive, requires_equals) = match spec {
         ParamMatcherSpec::Exact {
@@ -1796,8 +2296,8 @@ fn compile_matcher(
             ..
         } => (
             CompiledMatcherKind::Regex {
-                chunk: regex_ref?.0,
-                index: regex_ref?.1,
+                chunk: regex_ref?.chunk,
+                index: regex_ref?.index,
             },
             *subject,
             *case_sensitive,
@@ -1822,11 +2322,13 @@ fn build_scope_index(scopes: &[CompiledScope], groups: &[RuleGroup]) -> ScopeInd
         let mut indexed = false;
         for scope_id in group.include_scopes.iter().copied() {
             scopes[scope_id].for_each_host_hint(|host| {
-                index
-                    .suffix
-                    .entry(host.to_ascii_lowercase().into_boxed_str())
-                    .or_default()
-                    .push(group_id);
+                if let Some(groups) = index.suffix.get_mut(host) {
+                    groups.push(group_id);
+                } else {
+                    index
+                        .suffix
+                        .insert(host.to_ascii_lowercase().into_boxed_str(), vec![group_id]);
+                }
                 indexed = true;
             });
         }
@@ -1835,6 +2337,89 @@ fn build_scope_index(scopes: &[CompiledScope], groups: &[RuleGroup]) -> ScopeInd
         }
     }
     index
+}
+
+fn build_redirect_index(
+    scopes: &[CompiledScope],
+    redirects: &[CompiledRedirectRule],
+) -> RedirectIndex {
+    let mut global = Vec::new();
+    let mut suffix = HashMap::<Box<str>, Vec<usize>>::new();
+    let mut provider = HashMap::<usize, Vec<usize>>::new();
+    let mut provider_regex = HashMap::<(usize, usize), Vec<usize>>::new();
+    let mut generic = Vec::new();
+    for (redirect_id, redirect) in redirects.iter().enumerate() {
+        if redirect.include.is_empty() {
+            global.push(redirect_id);
+            continue;
+        }
+        let mut indexed = false;
+        let mut has_unindexed_include = false;
+        for scope_id in redirect.include.iter().copied() {
+            if let CompiledScope::ProviderPattern(pattern) = &scopes[scope_id] {
+                match pattern {
+                    ProviderMatcher::Direct { match_index, .. } => {
+                        provider.entry(*match_index).or_default().push(redirect_id);
+                    }
+                    ProviderMatcher::Regex(pattern) => {
+                        provider_regex
+                            .entry((pattern.chunk, pattern.index))
+                            .or_default()
+                            .push(redirect_id);
+                    }
+                }
+                indexed = true;
+                continue;
+            }
+            let mut scope_indexed = false;
+            scopes[scope_id].for_each_host_hint(|host| {
+                let host = host
+                    .trim_start_matches('.')
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                if host.is_empty()
+                    || !host.is_ascii()
+                    || !host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+                {
+                    return;
+                }
+                let candidates = if let Some(candidates) = suffix.get_mut(host.as_str()) {
+                    candidates
+                } else {
+                    suffix.entry(host.into_boxed_str()).or_default()
+                };
+                if candidates.last().copied() != Some(redirect_id) {
+                    candidates.push(redirect_id);
+                }
+                indexed = true;
+                scope_indexed = true;
+            });
+            if !scope_indexed {
+                has_unindexed_include = true;
+            }
+        }
+        if !indexed || has_unindexed_include {
+            generic.push(redirect_id);
+        }
+    }
+    RedirectIndex {
+        global: global.into_boxed_slice(),
+        suffix: suffix
+            .into_iter()
+            .map(|(host, ids)| (host, ids.into_boxed_slice()))
+            .collect(),
+        provider: provider
+            .into_iter()
+            .map(|(provider, ids)| (provider, ids.into_boxed_slice()))
+            .collect(),
+        provider_regex: provider_regex
+            .into_iter()
+            .map(|((chunk, index), ids)| (IndexedRegex { chunk, index }, ids.into_boxed_slice()))
+            .collect(),
+        generic: generic.into_boxed_slice(),
+    }
 }
 
 fn intern_scopes(
@@ -1854,15 +2439,16 @@ fn scopes_match(
     exclude: &[ScopeId],
     raw_url: &str,
     parsed: &Url,
+    provider_matches: &ProviderMatches,
 ) -> bool {
     let included = include.is_empty()
         || include
             .iter()
-            .any(|id| scopes[*id].matches(raw_url, parsed));
+            .any(|id| scopes[*id].matches(raw_url, parsed, provider_matches));
     included
         && !exclude
             .iter()
-            .any(|id| scopes[*id].matches(raw_url, parsed))
+            .any(|id| scopes[*id].matches(raw_url, parsed, provider_matches))
 }
 
 fn compile_scope(spec: &ScopeSpec) -> std::result::Result<CompiledScope, String> {
@@ -1875,10 +2461,8 @@ fn compile_scope(spec: &ScopeSpec) -> std::result::Result<CompiledScope, String>
             if !regex_pattern_allowed(pattern) {
                 return Err("pattern exceeds hard byte limit".into());
             }
-            let regex = checked_generated_regex(&glob_to_regex(pattern))
-                .map_err(|error| error.to_string())?;
             Ok(CompiledScope::UrlGlob {
-                regex,
+                pattern: pattern.clone(),
                 host_suffix: extract_glob_host_suffix(pattern),
             })
         }
@@ -1890,23 +2474,21 @@ fn compile_scope(spec: &ScopeSpec) -> std::result::Result<CompiledScope, String>
             if !regex_pattern_allowed(pattern) {
                 return Err("pattern exceeds hard byte limit".into());
             }
-            let regex = checked_generated_regex(&adguard_target_regex(pattern, *match_case))
-                .map_err(|error| error.to_string())?;
+            if adguard_target_regex(pattern, *match_case).len() > MAX_GENERATED_REGEX_BYTES {
+                return Err("generated pattern exceeds hard byte limit".into());
+            }
             let host_suffix = domains
                 .first()
                 .cloned()
                 .or_else(|| extract_adguard_host(pattern));
             Ok(CompiledScope::AdGuardTarget {
-                regex,
+                pattern: pattern.clone(),
+                match_case: *match_case,
                 domains: domains.clone(),
                 host_suffix,
             })
         }
     }
-}
-
-fn compile_url_pattern(pattern: &str) -> Option<Regex> {
-    checked_regex(&format!("(?i){pattern}")).ok()
 }
 
 fn compile_whole_url_pattern(pattern: &str) -> Option<Regex> {
@@ -1923,9 +2505,15 @@ fn format_regex_for_scope(pattern: &str) -> String {
 
 fn compile_redirect_extractor(ir: &RedirectExtractorIr) -> Option<RedirectExtractor> {
     match ir {
-        RedirectExtractorIr::ClearUrls { pattern } => checked_regex(&format!("(?i){pattern}"))
-            .ok()
-            .map(|regex| RedirectExtractor::ClearUrls { regex }),
+        RedirectExtractorIr::ClearUrls { pattern } => {
+            checked_regex(&format!("(?i){pattern}")).ok().map(|regex| {
+                if pattern.as_ref() == GOOGLE_SEARCH_REDIRECT_PATTERN {
+                    RedirectExtractor::ClearUrlsGoogle { regex }
+                } else {
+                    RedirectExtractor::ClearUrls { regex }
+                }
+            })
+        }
         RedirectExtractorIr::QueryParam {
             names,
             decode,
@@ -1949,6 +2537,33 @@ fn compile_redirect_extractor(ir: &RedirectExtractorIr) -> Option<RedirectExtrac
     }
 }
 
+fn compile_redirect_extractors(
+    pending: &[PendingRedirectCompile],
+) -> Vec<Option<RedirectExtractor>> {
+    if pending.len() < 2 {
+        return pending
+            .iter()
+            .map(|rule| compile_redirect_extractor(&rule.extractor))
+            .collect();
+    }
+    let midpoint = pending.len().div_ceil(2);
+    let (left, right) = pending.split_at(midpoint);
+    std::thread::scope(|scope| {
+        let right = scope.spawn(|| {
+            right
+                .iter()
+                .map(|rule| compile_redirect_extractor(&rule.extractor))
+                .collect::<Vec<_>>()
+        });
+        let mut compiled = left
+            .iter()
+            .map(|rule| compile_redirect_extractor(&rule.extractor))
+            .collect::<Vec<_>>();
+        compiled.extend(right.join().expect("redirect compiler worker panicked"));
+        compiled
+    })
+}
+
 fn extract_redirect_target(
     extractor: &RedirectExtractor,
     raw_url: &str,
@@ -1958,6 +2573,15 @@ fn extract_redirect_target(
         RedirectExtractor::ClearUrls { regex } => regex
             .captures(raw_url)
             .and_then(|captures| captures.get(1).map(|match_| match_.as_str().to_string())),
+        RedirectExtractor::ClearUrlsGoogle { regex } => {
+            if raw_url.is_ascii() {
+                extract_google_search_redirect(raw_url)
+            } else {
+                regex
+                    .captures(raw_url)
+                    .and_then(|captures| captures.get(1).map(|match_| match_.as_str().to_string()))
+            }
+        }
         RedirectExtractor::QueryParam {
             names,
             decode,
@@ -2020,6 +2644,75 @@ fn extract_redirect_target(
     }
 }
 
+fn extract_google_search_redirect(raw_url: &str) -> Option<String> {
+    debug_assert!(raw_url.is_ascii());
+    let after_scheme = raw_url
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &raw_url[8..])
+        .or_else(|| {
+            raw_url
+                .get(..7)
+                .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+                .map(|_| &raw_url[7..])
+        })?;
+    let marker = after_scheme
+        .as_bytes()
+        .windows(5)
+        .position(|window| window.eq_ignore_ascii_case(b"/url?"))?;
+    let host = &after_scheme[..marker];
+    let labels = host.split('.').collect::<Vec<_>>();
+    let valid_subdomain = |label: &&str| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    let valid_tld =
+        |label: &&str| label.len() >= 2 && label.bytes().all(|byte| byte.is_ascii_alphabetic());
+    if !(0..labels.len().saturating_sub(1)).any(|google| {
+        labels[google].eq_ignore_ascii_case("google")
+            && labels[..google].iter().all(valid_subdomain)
+            && labels[google + 1..].iter().all(valid_tld)
+    }) {
+        return None;
+    }
+
+    let query = &after_scheme[marker + 5..];
+    for offset in 0..query.len() {
+        let rest = &query[offset..];
+        let value = if rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("url="))
+        {
+            &rest[4..]
+        } else if rest
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("q="))
+        {
+            &rest[2..]
+        } else {
+            continue;
+        };
+        let capture = value.split('&').next().unwrap_or_default();
+        let http = capture
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http"));
+        let suffix_start = if capture
+            .get(4..5)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("s"))
+        {
+            5
+        } else {
+            4
+        };
+        if http && capture.len() > suffix_start {
+            return Some(capture.to_string());
+        }
+    }
+    None
+}
+
 fn prepend_scheme_value(value: &str, scheme: &str) -> Option<String> {
     if Url::parse(value).is_ok() {
         return None;
@@ -2055,7 +2748,10 @@ fn contains_embedded_url(raw_url: &str) -> bool {
             .is_some_and(|offset| lower[offset + 3..].contains("://"))
 }
 
-fn regex_matches_embedded_url(regex: &Regex, raw_url: &str) -> bool {
+fn scopes_match_embedded_beacon(store: &RuleStore, raw_url: &str) -> bool {
+    if !contains_embedded_url(raw_url) {
+        return false;
+    }
     let decoded = decode_query_component(raw_url);
     let lower = decoded.to_ascii_lowercase();
     let mut offset = 0;
@@ -2068,8 +2764,21 @@ fn regex_matches_embedded_url(regex: &Regex, raw_url: &str) -> bool {
             break;
         };
         let start = offset + relative;
-        if regex.is_match(&decoded[start..]) {
-            return true;
+        let candidate = &decoded[start..];
+        if let Ok(parsed) = Url::parse(candidate) {
+            let provider_matches = match_provider_patterns(store, candidate);
+            if store.beacons.iter().any(|rule| {
+                scopes_match(
+                    &store.scopes,
+                    &rule.include,
+                    &rule.exclude,
+                    candidate,
+                    &parsed,
+                    &provider_matches,
+                )
+            }) {
+                return true;
+            }
         }
         offset = start.saturating_add(1);
     }
@@ -2091,17 +2800,173 @@ fn host_suffix_matches(host: &str, suffix: &str) -> bool {
     host == suffix || host.ends_with(&format!(".{suffix}"))
 }
 
-fn glob_to_regex(pattern: &str) -> String {
-    let mut out = String::from("(?is)^");
-    for character in pattern.chars() {
-        match character {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
-            _ => out.push_str(&regex::escape(&character.to_string())),
+fn adguard_target_matches(pattern: &str, raw_url: &str, match_case: bool) -> bool {
+    let domain_anchor = pattern.starts_with("||");
+    let anchored_start = !domain_anchor && pattern.starts_with('|');
+    let anchored_end = pattern.ends_with('|') && !pattern.ends_with("\\|");
+    let body_start = if domain_anchor {
+        2
+    } else if anchored_start {
+        1
+    } else {
+        0
+    };
+    let body_end = if anchored_end {
+        pattern.len().saturating_sub(1).max(body_start)
+    } else {
+        pattern.len()
+    };
+    let body = &pattern[body_start..body_end];
+
+    if domain_anchor {
+        for marker_start in raw_url
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(raw_url.len()))
+        {
+            let remainder = &raw_url[marker_start..];
+            let scheme_len = ["https://", "http://"].into_iter().find_map(|scheme| {
+                let prefix = remainder.get(..scheme.len())?;
+                let matches = if match_case {
+                    prefix == scheme
+                } else {
+                    prefix.eq_ignore_ascii_case(scheme)
+                };
+                matches.then_some(scheme.len())
+            });
+            let Some(scheme_len) = scheme_len else {
+                continue;
+            };
+            let authority_start = marker_start + scheme_len;
+            let authority_end = raw_url[authority_start..]
+                .find(['/', '?', '#'])
+                .map(|offset| authority_start + offset)
+                .unwrap_or(raw_url.len());
+            let mut start = authority_start;
+            loop {
+                if adguard_glob_matches_at(body, &raw_url[start..], match_case, anchored_end) {
+                    return true;
+                }
+                let Some(dot) = raw_url[start..authority_end].find('.') else {
+                    break;
+                };
+                start += dot + 1;
+            }
+        }
+        return false;
+    }
+
+    if anchored_start {
+        return adguard_glob_matches_at(body, raw_url, match_case, anchored_end);
+    }
+
+    raw_url
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(raw_url.len()))
+        .any(|offset| adguard_glob_matches_at(body, &raw_url[offset..], match_case, anchored_end))
+}
+
+fn adguard_glob_matches_at(
+    pattern: &str,
+    value: &str,
+    match_case: bool,
+    anchored_end: bool,
+) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut pattern_index = 0usize;
+    let mut value_index = 0usize;
+    let mut star = None;
+    let mut star_value = 0usize;
+
+    loop {
+        if pattern_index == pattern.len() {
+            if !anchored_end || value_index == value.len() {
+                return true;
+            }
+        } else if pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_value = value_index;
+            continue;
+        } else if pattern[pattern_index] == b'^' && value_index == value.len() {
+            pattern_index += 1;
+            continue;
+        } else if value_index < value.len() {
+            let expected = pattern[pattern_index];
+            let actual = value[value_index];
+            let matches = if expected == b'^' {
+                !actual.is_ascii_alphanumeric() && !matches!(actual, b'_' | b'.' | b'%' | b'-')
+            } else if match_case {
+                expected == actual
+            } else {
+                expected.eq_ignore_ascii_case(&actual)
+            };
+            if matches {
+                pattern_index += 1;
+                value_index += 1;
+                continue;
+            }
+        }
+
+        let Some(star_index) = star else {
+            return false;
+        };
+        if star_value == value.len() {
+            return false;
+        }
+        star_value += 1;
+        pattern_index = star_index + 1;
+        value_index = star_value;
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let mut pattern = pattern.chars().peekable();
+    let mut value = value.chars().peekable();
+    let mut star_pattern = None;
+    let mut star_value = None;
+
+    loop {
+        match (pattern.peek().copied(), value.peek().copied()) {
+            (Some('*'), _) => {
+                pattern.next();
+                star_pattern = Some(pattern.clone());
+                star_value = Some(value.clone());
+            }
+            (Some('?'), Some(_)) => {
+                pattern.next();
+                value.next();
+            }
+            (Some(expected), Some(actual)) if chars_eq_ignore_case(expected, actual) => {
+                pattern.next();
+                value.next();
+            }
+            (None, None) => return true,
+            _ => {
+                let (Some(saved_pattern), Some(mut saved_value)) =
+                    (star_pattern.clone(), star_value.clone())
+                else {
+                    return false;
+                };
+                if saved_value.next().is_none() {
+                    return false;
+                }
+                pattern = saved_pattern;
+                value = saved_value.clone();
+                star_value = Some(saved_value);
+            }
         }
     }
-    out.push('$');
-    out
+}
+
+fn chars_eq_ignore_case(left: char, right: char) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left.to_lowercase().eq(right.to_lowercase()) || left.to_uppercase().eq(right.to_uppercase())
+    }
 }
 
 fn extract_glob_host_suffix(pattern: &str) -> Option<Box<str>> {
@@ -2111,25 +2976,34 @@ fn extract_glob_host_suffix(pattern: &str) -> Option<Box<str>> {
         return None;
     }
     let host = host.strip_prefix("*.").unwrap_or(host);
-    if host.is_empty() || host.contains('*') {
+    if host.is_empty()
+        || !host.is_ascii()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
         return None;
     }
     Some(host.to_ascii_lowercase().into_boxed_str())
 }
 
 fn adguard_target_regex(pattern: &str, match_case: bool) -> String {
-    let mut pattern = pattern;
     let domain_anchor = pattern.starts_with("||");
     let anchored_start = !domain_anchor && pattern.starts_with('|');
     let anchored_end = pattern.ends_with('|') && !pattern.ends_with("\\|");
-    if domain_anchor {
-        pattern = &pattern[2..];
+    let body_start = if domain_anchor {
+        2
     } else if anchored_start {
-        pattern = &pattern[1..];
-    }
-    if anchored_end {
-        pattern = &pattern[..pattern.len() - 1];
-    }
+        1
+    } else {
+        0
+    };
+    let body_end = if anchored_end {
+        pattern.len().saturating_sub(1).max(body_start)
+    } else {
+        pattern.len()
+    };
+    let pattern = &pattern[body_start..body_end];
 
     let mut out = if match_case {
         String::new()
@@ -2160,32 +3034,6 @@ fn extract_adguard_host(pattern: &str) -> Option<Box<str>> {
     (!host.is_empty() && !host.contains(':')).then(|| host.to_ascii_lowercase().into_boxed_str())
 }
 
-fn compile_beacon_raw_regex(pattern: &str) -> Option<Regex> {
-    let domain_anchor = pattern.starts_with("||");
-    let literal = if domain_anchor {
-        &pattern[2..]
-    } else {
-        pattern.trim_start_matches('|')
-    };
-    let mut regex = String::from("(?i)");
-    if domain_anchor {
-        // AdGuard's `||` is a host boundary, not a substring operator.  Keep
-        // the raw-source fallback for proxy URLs, including encoded embedded
-        // destinations, while requiring a real or encoded URL authority.
-        regex.push_str(r"(?:https?://|https?%3a%2f%2f|%2f%2f)(?:[a-z0-9-]+\.)*");
-    }
-    for character in literal.chars() {
-        match character {
-            '*' => regex.push_str(".*"),
-            '^' if domain_anchor => regex.push_str("(?:[^A-Za-z0-9_.-]|$)"),
-            '^' => regex.push_str("(?:[^A-Za-z0-9_.%-]|$)"),
-            '|' => {}
-            _ => regex.push_str(&regex::escape(&character.to_string())),
-        }
-    }
-    checked_generated_regex(&regex).ok()
-}
-
 fn regex_pattern_allowed(pattern: &str) -> bool {
     pattern.len() <= MAX_REGEX_PATTERN_BYTES
 }
@@ -2194,15 +3042,6 @@ fn checked_regex(pattern: &str) -> std::result::Result<Regex, regex::Error> {
     if !regex_pattern_allowed(pattern) {
         return Err(regex::Error::Syntax(
             "pattern exceeds hard byte limit".into(),
-        ));
-    }
-    Regex::new(pattern)
-}
-
-fn checked_generated_regex(pattern: &str) -> std::result::Result<Regex, regex::Error> {
-    if pattern.len() > MAX_GENERATED_REGEX_BYTES {
-        return Err(regex::Error::Syntax(
-            "generated pattern exceeds hard byte limit".into(),
         ));
     }
     Regex::new(pattern)
@@ -2279,7 +3118,9 @@ fn parse_clearurls(
     };
     for (name, provider) in raw.providers {
         let provider_pattern = format!("(?i){}", provider.url_pattern);
-        if !regex_pattern_allowed(&provider_pattern) || Regex::new(&provider_pattern).is_err() {
+        if !regex_pattern_allowed(&provider_pattern)
+            || regex_syntax::parse(&provider_pattern).is_err()
+        {
             counters.failed(format!("{name}.urlPattern"));
             ir.failed_regexes += 1;
             continue;
@@ -2287,7 +3128,7 @@ fn parse_clearurls(
         let mut exceptions = Vec::with_capacity(provider.exceptions.len());
         for pattern in &provider.exceptions {
             let compiled = format!("(?i){pattern}");
-            if !regex_pattern_allowed(&compiled) || Regex::new(&compiled).is_err() {
+            if !regex_pattern_allowed(&compiled) || regex_syntax::parse(&compiled).is_err() {
                 counters.failed(format!("{name}.exceptions:{pattern}"));
                 ir.failed_regexes += 1;
                 return Err(CleanerError::Config(format!(
@@ -2339,7 +3180,7 @@ fn parse_clearurls(
         for pattern in &provider.redirections {
             ir.parsed_rules += 1;
             let compiled = format!("(?i){pattern}");
-            if !regex_pattern_allowed(&compiled) || Regex::new(&compiled).is_err() {
+            if !regex_pattern_allowed(&compiled) || regex_syntax::parse(&compiled).is_err() {
                 ir.failed_regexes += 1;
                 counters.failed(format!("{name}.redirections:{pattern}"));
                 continue;
@@ -2357,7 +3198,7 @@ fn parse_clearurls(
         for pattern in &provider.raw_rules {
             ir.parsed_rules += 1;
             let compiled = format!("(?i){pattern}");
-            if !regex_pattern_allowed(&compiled) || Regex::new(&compiled).is_err() {
+            if !regex_pattern_allowed(&compiled) || regex_syntax::parse(&compiled).is_err() {
                 ir.failed_regexes += 1;
                 counters.failed(format!("{name}.rawRules:{pattern}"));
                 continue;
@@ -2731,7 +3572,8 @@ fn parse_adguard(
                 // case behavior. `$match-case` controls target matching; it
                 // must not silently make a value regex broader.
                 let pattern = format!("^(?:{pattern})$");
-                if pattern.len() > MAX_REGEX_PATTERN_BYTES || Regex::new(&pattern).is_err() {
+                if pattern.len() > MAX_REGEX_PATTERN_BYTES || regex_syntax::parse(&pattern).is_err()
+                {
                     ir.failed_regexes += 1;
                     counters.failed(format!("AdGuard removeparam regex: {line}"));
                     continue;
@@ -2831,36 +3673,39 @@ fn normalize_clearurls_pattern(
     if pattern.len() > MAX_REGEX_PATTERN_BYTES {
         return Err("pattern exceeds hard byte limit".into());
     }
-    if Regex::new(&compiled).is_err() {
-        return Err("unsupported or invalid regex".into());
+    if pattern.is_ascii() && !pattern.bytes().any(is_regex_meta_byte) {
+        return Ok(vec![ParamMatcherSpec::Exact {
+            value: pattern.to_ascii_lowercase().into_boxed_str(),
+            subject: ParamSubject::DecodedName,
+            case_sensitive: false,
+            requires_equals: false,
+        }]);
     }
-    let hir = regex_syntax::parse(pattern).ok();
-    if let Some(hir) = hir {
-        if let Some(prefix) = literal_prefix(&hir) {
-            if !prefix.is_empty() {
-                return Ok(vec![ParamMatcherSpec::Prefix {
-                    value: prefix.to_ascii_lowercase().into_boxed_str(),
+    let hir = regex_syntax::parse(pattern).map_err(|_| "unsupported or invalid regex")?;
+    if let Some(prefix) = literal_prefix(&hir) {
+        if !prefix.is_empty() {
+            return Ok(vec![ParamMatcherSpec::Prefix {
+                value: prefix.to_ascii_lowercase().into_boxed_str(),
+                subject: ParamSubject::DecodedName,
+                case_sensitive: false,
+                requires_equals: false,
+            }]);
+        }
+    }
+    if let Some(values) = expand_hir(&hir, MAX_LITERAL_EXPANSION) {
+        if !values.is_empty()
+            && values.iter().all(|value| value.is_ascii())
+            && values.len() <= MAX_LITERAL_EXPANSION
+        {
+            return Ok(values
+                .into_iter()
+                .map(|value| ParamMatcherSpec::Exact {
+                    value: value.to_ascii_lowercase().into_boxed_str(),
                     subject: ParamSubject::DecodedName,
                     case_sensitive: false,
                     requires_equals: false,
-                }]);
-            }
-        }
-        if let Some(values) = expand_hir(&hir, MAX_LITERAL_EXPANSION) {
-            if !values.is_empty()
-                && values.iter().all(|value| value.is_ascii())
-                && values.len() <= MAX_LITERAL_EXPANSION
-            {
-                return Ok(values
-                    .into_iter()
-                    .map(|value| ParamMatcherSpec::Exact {
-                        value: value.to_ascii_lowercase().into_boxed_str(),
-                        subject: ParamSubject::DecodedName,
-                        case_sensitive: false,
-                        requires_equals: false,
-                    })
-                    .collect());
-            }
+                })
+                .collect());
         }
     }
     Ok(vec![ParamMatcherSpec::Regex {
@@ -2869,6 +3714,25 @@ fn normalize_clearurls_pattern(
         case_sensitive: false,
         requires_equals: false,
     }])
+}
+
+fn is_regex_meta_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'.' | b'^'
+            | b'$'
+            | b'*'
+            | b'+'
+            | b'?'
+            | b'{'
+            | b'}'
+            | b'['
+            | b']'
+            | b'\\'
+            | b'|'
+            | b'('
+            | b')'
+    )
 }
 
 fn literal_prefix(hir: &Hir) -> Option<String> {
@@ -3180,5 +4044,466 @@ mod tests {
         .unwrap();
         assert_eq!(rs.stats().regex_param_rules, 0);
         assert_eq!(rs.stats().exact_param_rules, 3);
+    }
+
+    /// The matcher used before Brave URL globs moved off `regex`.
+    fn legacy_brave_glob_matches(pattern: &str, value: &str) -> bool {
+        let mut expression = String::from("(?is)^");
+        for character in pattern.chars() {
+            match character {
+                '*' => expression.push_str(".*"),
+                '?' => expression.push('.'),
+                _ => expression.push_str(&regex::escape(&character.to_string())),
+            }
+        }
+        expression.push('$');
+        Regex::new(&expression).unwrap().is_match(value)
+    }
+
+    /// The matcher used before AdGuard target expressions moved off `regex`.
+    fn legacy_adguard_target_matches(pattern: &str, value: &str, match_case: bool) -> bool {
+        let mut pattern = pattern;
+        let domain_anchor = pattern.starts_with("||");
+        let anchored_start = !domain_anchor && pattern.starts_with('|');
+        let anchored_end = pattern.ends_with('|') && !pattern.ends_with("\\|");
+        if domain_anchor {
+            pattern = &pattern[2..];
+        } else if anchored_start {
+            pattern = &pattern[1..];
+        }
+        if anchored_end {
+            pattern = &pattern[..pattern.len() - 1];
+        }
+
+        let mut expression = if match_case {
+            String::new()
+        } else {
+            String::from("(?i)")
+        };
+        if domain_anchor {
+            expression.push_str("https?://(?:[^/?#]+\\.)?");
+        } else if anchored_start {
+            expression.push('^');
+        }
+        for character in pattern.chars() {
+            match character {
+                '*' => expression.push_str(".*"),
+                '^' => expression.push_str("(?:[^A-Za-z0-9_.%-]|$)"),
+                _ => expression.push_str(&regex::escape(&character.to_string())),
+            }
+        }
+        if anchored_end {
+            expression.push('$');
+        }
+        Regex::new(&expression).unwrap().is_match(value)
+    }
+
+    #[derive(Clone, Copy)]
+    struct DeterministicAscii(u64);
+
+    impl DeterministicAscii {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn string(&mut self, alphabet: &[u8], max_len: usize) -> String {
+            let len = self.next() as usize % (max_len + 1);
+            (0..len)
+                .map(|_| alphabet[self.next() as usize % alphabet.len()] as char)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn brave_glob_matcher_is_equivalent_to_legacy_regex_for_ascii_inputs() {
+        let patterns = [
+            "*",
+            "*://*.example.com/*",
+            "https://example.com/path?value=*",
+            "HTTPS://EXAMPLE.COM/*",
+            "?://?/*",
+            "https://example.com/%2F*",
+            "https://example.com/a?b",
+            "https://example.com/literal.+()[]{}^$|\\*",
+            "line?break",
+        ];
+        let values = [
+            "",
+            "https://example.com/",
+            "HTTP://EXAMPLE.COM/path",
+            "https://sub.example.com/path?value=%2F",
+            "https://example.com/%2fencoded",
+            "https://example.com/a?b",
+            "https://example.com/aXb",
+            "line\nbreak",
+            "mailto:user@example.com",
+        ];
+        for pattern in patterns {
+            for value in values {
+                assert_eq!(
+                    glob_matches(pattern, value),
+                    legacy_brave_glob_matches(pattern, value),
+                    "Brave glob mismatch: pattern={pattern:?}, value={value:?}"
+                );
+            }
+        }
+
+        let mut random = DeterministicAscii(0x6272_6176_652d_676c);
+        let pattern_alphabet = b"abXY09*?./:%_-+&=#";
+        let value_alphabet = b"abXY09./:%_-+&=#?";
+        for _ in 0..10_000 {
+            let pattern = random.string(pattern_alphabet, 18);
+            let value = random.string(value_alphabet, 30);
+            assert_eq!(
+                glob_matches(&pattern, &value),
+                legacy_brave_glob_matches(&pattern, &value),
+                "generated Brave glob mismatch: pattern={pattern:?}, value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adguard_target_matcher_is_equivalent_to_legacy_regex_for_ascii_inputs() {
+        let patterns = [
+            "tracker",
+            "|https://example.com/path|",
+            "||example.com^",
+            "||example.com/path*",
+            "||sub.example.com^pixel",
+            "example.com^",
+            "*/collect?*",
+            "|mailto:user@example.com|",
+            "||example.com/%2F*",
+            r"literal\\|",
+        ];
+        let values = [
+            "",
+            "https://example.com/",
+            "http://sub.example.com/path",
+            "HTTPS://EXAMPLE.COM/path",
+            "https://example.com.evil/path",
+            "https://notexample.com/path",
+            "https://example.com/%2Fencoded",
+            "https://proxy.invalid/?u=https://example.com/pixel",
+            "mailto:user@example.com",
+        ];
+        for match_case in [false, true] {
+            for pattern in patterns {
+                for value in values {
+                    assert_eq!(
+                        adguard_target_matches(pattern, value, match_case),
+                        legacy_adguard_target_matches(pattern, value, match_case),
+                        "AdGuard mismatch: pattern={pattern:?}, value={value:?}, match_case={match_case}"
+                    );
+                }
+            }
+        }
+
+        let mut random = DeterministicAscii(0x6164_6775_6172_642d);
+        let body_alphabet = b"abXY09*^./:%_-+&=#?";
+        let value_alphabet = b"abXY09./:%_-+&=#?";
+        let bases = [
+            "https://example.com/",
+            "http://sub.example.com/",
+            "HTTPS://EXAMPLE.COM/",
+            "https://proxy.invalid/?url=https://example.com/",
+            "mailto:user@example.com/",
+        ];
+        for iteration in 0..10_000 {
+            let prefix = match random.next() % 3 {
+                0 => "",
+                1 => "|",
+                _ => "||",
+            };
+            let mut body = random.string(body_alphabet, 16);
+            // A target expression containing only its anchor marker is not a
+            // valid AdGuard rule and made the legacy translator underflow too.
+            if body.is_empty() {
+                body.push('a');
+            }
+            let suffix = if random.next() % 4 == 0 { "|" } else { "" };
+            let pattern = format!("{prefix}{body}{suffix}");
+            let base = bases[random.next() as usize % bases.len()];
+            let value = format!("{base}{}", random.string(value_alphabet, 24));
+            let match_case = iteration % 2 == 0;
+            assert_eq!(
+                adguard_target_matches(&pattern, &value, match_case),
+                legacy_adguard_target_matches(&pattern, &value, match_case),
+                "generated AdGuard mismatch: pattern={pattern:?}, value={value:?}, match_case={match_case}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_regex_set_preserves_provider_and_exception_mapping() {
+        let ruleset = Ruleset::from_clearurls_str(
+            r#"{"providers":{
+                "alpha":{"urlPattern":"^https://alpha\\.example/","rules":["shared"],"exceptions":["keep=1"]},
+                "beta":{"urlPattern":"^https://beta\\.example/","rules":["shared"],"exceptions":["keep=2"]}
+            }}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ruleset.detect_provider("https://alpha.example/path"),
+            Some("alpha")
+        );
+        assert_eq!(
+            ruleset.detect_provider("https://beta.example/path"),
+            Some("beta")
+        );
+        assert_eq!(ruleset.detect_provider("https://other.example/path"), None);
+        assert!(ruleset.is_exception("https://alpha.example/path?keep=1"));
+        assert!(!ruleset.is_exception("https://alpha.example/path?keep=2"));
+        assert!(ruleset.is_exception("https://beta.example/path?keep=2"));
+        assert_eq!(ruleset.stats().scopes, 2);
+        assert_eq!(ruleset.stats().groups, 2);
+    }
+
+    #[test]
+    fn direct_provider_matcher_is_equivalent_to_regex_for_supported_shapes() {
+        let patterns = [
+            r"^https?://example\.com/path",
+            r"^https?:\/\/example\.com\/path\?",
+            r"^https?://site\.com/path",
+            r"^https?://(?:[a-z0-9-]+\.)*?example\.com/path",
+            r"^https?:\/\/(?:[a-z0-9-]+\.)*?example\.com\/path",
+        ];
+        let values = [
+            "https://example.com/path",
+            "HTTPS://EXAMPLE.COM/PATH",
+            "http://sub.example.com/path?x=1",
+            "https://two.sub.example.com/path",
+            "https://bad_.example.com/path",
+            "https://exampleXcom/path",
+            "https://example.comevil/path",
+            "https://example.com.evil/path",
+            "https://example.com:443/path",
+            "https://u@example.com/path",
+            "https://.example.com/path",
+            "https://ſite.com/path",
+            "ftp://example.com/path",
+        ];
+        for pattern in patterns {
+            let direct = compile_provider_direct_pattern(pattern).unwrap();
+            let regex = Regex::new(&format!("(?i){pattern}")).unwrap();
+            for value in values {
+                assert_eq!(
+                    match &direct {
+                        ProviderMatcher::Direct {
+                            literals,
+                            subdomains,
+                            ..
+                        } => literals.iter().any(|literal| provider_direct_matches(
+                            literal,
+                            *subdomains,
+                            value
+                        )),
+                        ProviderMatcher::Regex(_) => unreachable!(),
+                    },
+                    regex.is_match(value),
+                    "provider mismatch: pattern={pattern:?}, value={value:?}"
+                );
+            }
+        }
+
+        for pattern in [
+            r"^https?://example.(com|net)",
+            r"^https?://example\.[a-z]{2,}",
+            r"https?://example\.com",
+            r"^https?://(?:[a-z0-9-]+\.)*?example\.com/.*",
+        ] {
+            assert!(compile_provider_direct_pattern(pattern).is_none());
+        }
+    }
+
+    #[test]
+    fn redirect_prefilter_preserves_capture_and_source_order() {
+        let ruleset = Ruleset::from_clearurls_str(
+            r#"{"providers":{"redirector":{
+                "urlPattern":"^https://redirect\\.example/",
+                "redirections":[
+                    "^https://redirect\\.example/out\\?first=([^&]+)",
+                    "^https://redirect\\.example/out\\?.*second=([^&]+)"
+                ]
+            }}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ruleset.redirect_target("https://redirect.example/out?first=one&second=two"),
+            Some("one".into())
+        );
+        assert_eq!(
+            ruleset.redirect_target("https://redirect.example/out?second=two"),
+            Some("two".into())
+        );
+        assert_eq!(
+            ruleset.redirect_target("https://redirect.example/other?first=one"),
+            None
+        );
+        assert_eq!(ruleset.stats().redirect_rules, 2);
+    }
+
+    fn linear_redirect_target(ruleset: &Ruleset, url: &str) -> Option<RedirectTarget> {
+        let parsed = Url::parse(url).ok()?;
+        let provider_matches = match_provider_patterns(&ruleset.store, url);
+        ruleset.store.redirects.iter().find_map(|rule| {
+            scopes_match(
+                &ruleset.store.scopes,
+                &rule.include,
+                &rule.exclude,
+                url,
+                &parsed,
+                &provider_matches,
+            )
+            .then(|| extract_redirect_target(&rule.extractor, url, &parsed))
+            .flatten()
+            .map(|target| RedirectTarget {
+                target,
+                origin: rule.origin,
+            })
+        })
+    }
+
+    #[test]
+    fn redirect_index_matches_linear_reference_for_adversarial_scopes() {
+        let mut builder = RulesetBuilder::new(RuleLoadLimits::default());
+        builder
+            .add_source_str(
+                "indexed-globs",
+                r#"[
+                    {"include":["*://first.example/*"],"exclude":["*://first.example/blocked*"],"action":"redirect","param":"first"},
+                    {"include":["*://hint.example/*","*"],"exclude":[],"action":"redirect","param":"generic"},
+                    {"include":["*://redirect.example:8443/*"],"exclude":[],"action":"redirect","param":"port"},
+                    {"include":["*://user@userinfo.example/*"],"exclude":[],"action":"redirect","param":"userinfo"},
+                    {"include":["*://[::1]/*"],"exclude":[],"action":"redirect","param":"ipv6"},
+                    {"include":["*://ſite.example/*"],"exclude":[],"action":"redirect","param":"unicode"}
+                ]"#,
+                Some(RulePackFormat::BraveDebounce),
+                None,
+            )
+            .unwrap();
+        builder
+            .add_source_str(
+                "providers",
+                r#"{"providers":{
+                    "direct":{"urlPattern":"^https://redirect\\.example","redirections":["^https://redirect\\.example\\.evil/out\\?direct=([^&]+)"]},
+                    "regex":{"urlPattern":"https://regex\\.example/","redirections":["^https://regex\\.example/out\\?regex=([^&]+)"]}
+                }}"#,
+                Some(RulePackFormat::ClearUrls),
+                None,
+            )
+            .unwrap();
+        let ruleset = builder.finish();
+
+        let cases = [
+            // Interleaved suffix and generic candidates retain source order.
+            (
+                "https://first.example/out?first=one&generic=two",
+                Some("one"),
+            ),
+            // Excluding the earlier suffix candidate permits the generic rule.
+            (
+                "https://first.example/blocked?first=one&generic=two",
+                Some("two"),
+            ),
+            // The unhinted half of an OR include forces a generic fallback.
+            (
+                "https://unrelated.example/out?generic=generic",
+                Some("generic"),
+            ),
+            // Unsafe authorities must remain generic rather than form unusable host keys.
+            ("https://redirect.example:8443/out?port=port", Some("port")),
+            (
+                "https://user@userinfo.example/out?userinfo=userinfo",
+                Some("userinfo"),
+            ),
+            ("https://[::1]/out?ipv6=ipv6", Some("ipv6")),
+            ("https://ſite.example/out?unicode=unicode", Some("unicode")),
+            // A direct provider is a raw prefix, not a host-bound suffix.
+            (
+                "https://redirect.example.evil/out?direct=direct",
+                Some("direct"),
+            ),
+            // Providers outside the structural fast path remain generic candidates.
+            ("https://regex.example/out?regex=regex", Some("regex")),
+            // Candidate lookup is defensive for normalized host variants.
+            ("HTTPS://FIRST.EXAMPLE/out?first=upper", Some("upper")),
+            ("https://first.example./out?first=dot", None),
+            ("https://sub.first.example/out?first=sub", None),
+        ];
+        for (url, expected) in cases {
+            let indexed = ruleset.redirect_target_with_origin(url);
+            let linear = linear_redirect_target(&ruleset, url);
+            assert_eq!(indexed, linear, "redirect index diverged for {url:?}");
+            assert_eq!(
+                indexed.as_ref().map(|target| target.target.as_str()),
+                expected,
+                "unexpected redirect result for {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn google_redirect_fast_path_matches_capture_regex() {
+        let regex = Regex::new(&format!("(?i){GOOGLE_SEARCH_REDIRECT_PATTERN}")).unwrap();
+        let values = [
+            "https://www.google.com/url?q=https://destination.example/path&source=mail",
+            "HTTP://GOOGLE.CO.UK/url?x=1&url=http://destination.example&q=https://later.example",
+            "https://google.foo1.google.com/url?notq=https://destination.example",
+            "https://google.com/url?q=ftp://destination.example&q=https://later.example",
+            "https://google.com/url?q=http",
+            "https://google.com.evil/url?q=https://destination.example",
+            "https://bad_.google.com/url?q=https://destination.example",
+            "https://google.com/search?q=https://destination.example",
+        ];
+        for value in values {
+            let expected = regex
+                .captures(value)
+                .and_then(|captures| captures.get(1).map(|matched| matched.as_str().to_string()));
+            assert_eq!(
+                extract_google_search_redirect(value),
+                expected,
+                "Google redirect mismatch for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_clearurls_fast_path_keeps_meta_patterns_on_regex_path() {
+        let ruleset = Ruleset::from_clearurls_str(
+            r#"{"providers":{"globalRules":{"urlPattern":"^https?://","rules":["Literal_Name","regex.+"]}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(ruleset.stats().exact_param_rules, 1);
+        assert_eq!(ruleset.stats().regex_param_rules, 1);
+        assert!(ruleset.param_is_tracking("https://example.test/", "literal_name", true, false));
+        assert!(ruleset.param_is_tracking("https://example.test/", "regex-value", true, false));
+    }
+
+    #[test]
+    fn degenerate_adguard_anchors_do_not_underflow() {
+        assert!(adguard_target_matches("|", "", false));
+        assert!(!adguard_target_matches("|", "https://example.test/", false));
+        assert!(!adguard_target_matches(
+            "||",
+            "https://example.test/",
+            false
+        ));
+        assert!(!adguard_target_matches("||", "HTTPS://example.test/", true));
+
+        let ruleset = Ruleset::from_adguard_str("||$removeparam=tracking").unwrap();
+        assert!(!ruleset.param_is_tracking(
+            "https://example.test/?tracking=1",
+            "tracking",
+            true,
+            false
+        ));
     }
 }
