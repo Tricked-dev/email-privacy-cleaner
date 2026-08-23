@@ -35,7 +35,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let mut cfg = match &cli.config {
-        Some(p) => match CleanerConfig::from_toml_file(p) {
+        Some(p) => match std::fs::read_to_string(p)
+            .map_err(|e| e.to_string())
+            .and_then(|text| CleanerConfig::parse_toml_str(&text).map_err(|e| e.to_string()))
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("error loading config {p:?}: {e}");

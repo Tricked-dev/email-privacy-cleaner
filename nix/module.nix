@@ -19,10 +19,11 @@ let
   cfg = config.services.email-privacy-milter;
   tomlFormat = pkgs.formats.toml { };
 
-  # Resolve each rule pack to a store path. Plain paths pass through; an
-  # `{ url; sha256; }` entry is prefetched at build time with `fetchurl` and
-  # pinned by hash, so the daemon loads it offline from the store (the
-  # per-message cleaning path never touches the network). Passed to the daemon
+  # Resolve each legacy ClearURLs-format rule pack to a store path. Plain paths pass
+  # through; an `{ url; sha256; }` entry is prefetched at build time with
+  # `fetchurl` and pinned by hash, so the daemon loads it offline from the
+  # store. Rule-pack loading is startup-only and the per-message cleaning path
+  # never fetches a pack. Passed to the daemon
   # as `--rule-pack` args, so this composes with EITHER `settings` or
   # `configFile` — the packs merge on top of whatever `rule_packs` the config
   # already lists.
@@ -81,6 +82,18 @@ in
       '';
     };
 
+    socketActivation = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Let systemd own the TCP listener and start the milter on the first
+        queued connection. The daemon consumes the single inherited socket at
+        file descriptor 3 and overlaps rule preparation with milter protocol
+        negotiation. Disable this to keep the daemon running continuously and
+        let it bind {option}`listen` itself.
+      '';
+    };
+
     settings = lib.mkOption {
       type = tomlFormat.type;
       default = { };
@@ -135,8 +148,8 @@ in
         [
           # A pack already in the store / repo:
           ./my-extra-rules.json
-          # Or prefetch the upstream ClearURLs data (pinned by hash) so it is
-          # baked into the store and loaded fully offline at runtime:
+          # Or prefetch an external pack (pinned by hash) so it is baked into
+          # the store and loaded fully offline at runtime:
           {
             url = "https://rules2.clearurls.xyz/data.min.json";
             sha256 = "sha256-AAAA...";
@@ -144,16 +157,34 @@ in
         ]
       '';
       description = ''
-        External ClearURLs-format rule packs to merge on top of the built-ins.
+        The binary includes only a small, manually maintained built-in list.
+        These optional external rule packs are merged on top of it; external
+        formats can be configured through local paths, HTTPS sources, or
+        Nix-prefetched store paths, and the data is not bundled.
+
+        Structured sources are configured through {option}`settings` using
+        `rule_pack_sources`. Each entry uses `source`, with `path` and `url`
+        accepted as aliases; `format` is optional and accepts `auto`,
+        `clear-urls`, `brave-clean-urls`, `brave-debounce`, or canonical
+        `ad-guard` (`adguard` is also accepted for compatibility).
+        Optional `usage = "mail-beacon"` permits modifierless AdGuard image
+        rules. The legacy `rule_packs` and `rule_pack_urls` arrays remain
+        supported and mean ClearURLs JSON.
+
+        The default `rule_limits` are 5 MiB per source, 25 MiB total, 32
+        sources, 50,000 external rules, 10,000 regex rules, and 16 diagnostic
+        samples per source. Each distinct source is attempted once during
+        startup; duplicate source strings are collapsed and no source is
+        loaded during per-message cleaning.
+
         Each entry is either a path, or an `{ url; sha256; }` attrset that is
         fetched with {function}`fetchurl` and pinned. The resolved store paths
         are passed to the daemon as `--rule-pack` arguments and merged on top of
         the `rule_packs` in {option}`settings`/{option}`configFile`, so this
-        composes with both and needs no network access at runtime.
+        composes with both and needs no rule-pack network access at runtime.
 
-        > The upstream ClearURLs rules are copyleft (LGPL); only their
-        > *parser* ships with this package. Prefetching the data here keeps your
-        > build reproducible and offline.
+        Prefetching external data here keeps the build reproducible and lets
+        the daemon load it fully offline at runtime.
       '';
     };
 
@@ -190,11 +221,30 @@ in
       }
     );
 
+    systemd.sockets.email-privacy-milter = lib.mkIf cfg.socketActivation {
+      description = "Socket for email privacy cleaner milter activation";
+      documentation = [ "https://github.com/tricked-dev/email-privacy-cleaner" ];
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ cfg.listen ];
+      socketConfig = {
+        # One long-running daemon consumes the listening socket. With
+        # Accept=false systemd passes that socket itself as fd 3 instead of
+        # spawning a service instance for each connection.
+        Accept = false;
+        NoDelay = true;
+        Backlog = 128;
+      };
+    };
+
     systemd.services.email-privacy-milter = {
       description = "Email privacy cleaner milter daemon";
       documentation = [ "https://github.com/tricked-dev/email-privacy-cleaner" ];
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
+      # systemd gives a same-named socket an implicit Before= relationship to
+      # the service it activates. Avoid putting network.target on the socket
+      # activated startup path: PID 1 already owns the bound listener, so the
+      # daemon has no network setup to wait for.
+      after = lib.optionals (!cfg.socketActivation) [ "network.target" ];
+      wantedBy = lib.optionals (!cfg.socketActivation) [ "multi-user.target" ];
 
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " (

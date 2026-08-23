@@ -92,6 +92,28 @@ pub fn preflight_ok(url: &Url) -> bool {
 /// cleaning path, so it is exempt from the "no network during cleaning" rule.
 #[cfg(feature = "network")]
 pub fn fetch_rule_pack(url: &str, timeout_ms: u64) -> crate::error::Result<String> {
+    let bytes = fetch_rule_pack_with_limit(url, timeout_ms, MAX_RULE_PACK_BYTES as usize)?;
+    if bytes.len() > MAX_RULE_PACK_BYTES as usize {
+        return Err(crate::error::CleanerError::Network(format!(
+            "rule pack exceeds configured byte limit of {}",
+            MAX_RULE_PACK_BYTES
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| crate::error::CleanerError::Network(format!("decoding {url}: {e}")))
+}
+
+/// Fetch a rule pack with the caller's per-source byte limit. The response is
+/// read through `limit + 1` bytes so the caller can classify an oversized
+/// source as a byte-budget skip before it enters parsing or ruleset
+/// compilation. The returned bytes therefore contain at most one byte beyond
+/// the configured limit and are not accepted automatically.
+#[cfg(feature = "network")]
+pub fn fetch_rule_pack_with_limit(
+    url: &str,
+    timeout_ms: u64,
+    max_bytes: usize,
+) -> crate::error::Result<Vec<u8>> {
     use std::io::Read;
     use std::time::Duration;
     let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -103,19 +125,12 @@ pub fn fetch_rule_pack(url: &str, timeout_ms: u64) -> crate::error::Result<Strin
         .get(url)
         .call()
         .map_err(|e| crate::error::CleanerError::Network(format!("fetching {url}: {e}")))?;
-    let mut reader = resp.into_reader().take(MAX_RULE_PACK_BYTES + 1);
+    let mut reader = resp.into_reader().take(max_bytes as u64 + 1);
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
         .map_err(|e| crate::error::CleanerError::Network(format!("reading {url}: {e}")))?;
-    if bytes.len() as u64 > MAX_RULE_PACK_BYTES {
-        return Err(crate::error::CleanerError::Network(format!(
-            "rule pack {url} exceeds {} bytes",
-            MAX_RULE_PACK_BYTES
-        )));
-    }
-    String::from_utf8(bytes)
-        .map_err(|e| crate::error::CleanerError::Network(format!("decoding {url}: {e}")))
+    Ok(bytes)
 }
 
 #[cfg(feature = "network")]

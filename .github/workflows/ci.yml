@@ -2,14 +2,17 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 # Cancel in-flight runs for the same ref when a newer commit lands.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,3 +62,18 @@ jobs:
 
       - name: cargo test (no-default-features)
         run: cargo test --locked --no-default-features
+
+  nix-flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Check flake
+        run: nix flake check

@@ -8,6 +8,7 @@
 //! * `print-trackers  < raw.eml`
 //! * `diff-message    < raw.eml`
 //! * `test-rules      fixtures/`
+//! * `rule-stats      --config config.toml`
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -15,9 +16,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use email_privacy_cleaner::config::CleanerConfig;
+use email_privacy_cleaner::ruleset::Ruleset;
 use email_privacy_cleaner::{
     clean_html, clean_message_fail_open, clean_url, unwrap_redirect_url, Mode,
 };
+use serde::Serialize;
 use url::Url;
 
 #[derive(Parser)]
@@ -84,12 +87,23 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Report immutable compiled rule statistics and bounded source diagnostics.
+    RuleStats {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn load_config(path: &Option<PathBuf>, extra_packs: &[PathBuf]) -> Result<CleanerConfig, String> {
     let mut c = match path {
-        Some(p) => CleanerConfig::from_toml_file(p).map_err(|e| e.to_string())?,
-        None => CleanerConfig::default(),
+        Some(p) => {
+            let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+            CleanerConfig::parse_toml_str(&text).map_err(|e| e.to_string())?
+        }
+        None => CleanerConfig::parse_toml_str("").map_err(|e| e.to_string())?,
     };
     c.rule_packs
         .extend(extra_packs.iter().map(|p| p.to_string_lossy().into_owned()));
@@ -186,6 +200,11 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::TestRules { dir, config } => {
             let cfg = load_config(&config, &rule_pack)?;
             test_rules(&dir, &cfg)
+        }
+        Command::RuleStats { config, json } => {
+            let cfg = load_config(&config, &rule_pack)?;
+            println!("{}", format_rule_stats(cfg.ruleset().as_ref(), json)?);
+            Ok(())
         }
     }
 }
@@ -511,4 +530,72 @@ fn test_rules(dir: &PathBuf, cfg: &CleanerConfig) -> Result<(), String> {
 
     println!("\n{total} fixtures processed, {failures} fail-open/error");
     Ok(())
+}
+
+#[derive(Serialize)]
+struct RuleStatsReport<'a> {
+    stats: &'a email_privacy_cleaner::ruleset::RuleStoreStats,
+    load_report: &'a email_privacy_cleaner::ruleset::RuleLoadReport,
+}
+
+fn format_rule_stats(ruleset: &Ruleset, json: bool) -> Result<String, String> {
+    let report = RuleStatsReport {
+        stats: ruleset.stats(),
+        load_report: ruleset.load_report(),
+    };
+    if json {
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+    } else {
+        let stats = report.stats;
+        let load = report.load_report;
+        let mut output = format!(
+            "ruleset: scopes={} groups={} exact_param_rules={} prefix_param_rules={} regex_param_rules={} regex_set_chunks={} domain_index_keys={} beacon_rules={} redirect_rules={} raw_rules={} providers={}\nload-report: total_bytes={} sources={}\n",
+            stats.scopes,
+            stats.groups,
+            stats.exact_param_rules,
+            stats.prefix_param_rules,
+            stats.regex_param_rules,
+            stats.regex_set_chunks,
+            stats.domain_index_keys,
+            stats.beacon_rules,
+            stats.redirect_rules,
+            stats.raw_rules,
+            stats.providers,
+            load.total_bytes,
+            load.sources.len(),
+        );
+        for source in &load.sources {
+            output.push_str(&format!(
+                "  source={} format={:?} bytes={} parsed={} accepted={} unsupported={} duplicates={} failed_regexes={} skipped={:?}\n",
+                source.source,
+                source.format,
+                source.bytes_read,
+                source.parsed_rules,
+                source.accepted_rules,
+                source.unsupported_rules,
+                source.duplicates,
+                source.failed_regexes,
+                source.skipped_reason,
+            ));
+        }
+        Ok(output.trim_end().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_stats_json_contains_frozen_stats_and_load_report() {
+        let config = CleanerConfig::default();
+        let ruleset = config.ruleset();
+
+        let output = format_rule_stats(ruleset.as_ref(), true).unwrap();
+
+        assert!(output.contains("\"stats\""));
+        assert!(output.contains("\"load_report\""));
+        assert!(output.contains("\"providers\""));
+        assert!(output.contains("\"sources\""));
+    }
 }

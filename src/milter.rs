@@ -12,7 +12,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::config::CleanerConfig;
 use crate::{clean_message_fail_open, CleanerResult};
@@ -89,30 +89,22 @@ impl MessageState {
         raw
     }
 
-    fn add_header(&mut self, name: Vec<u8>, value: Vec<u8>, config: &CleanerConfig) {
+    fn add_header(&mut self, mut name: Vec<u8>, mut value: Vec<u8>, max_message_size: usize) {
         // Defence in depth: an upstream MTA that lets CR/LF leak into the
         // milter `value` would let us reconstruct a message with smuggled
         // headers (the bytes would be emitted verbatim by `reconstruct`).
         // Replace any control byte that isn't tab with a space.
-        let value: Vec<u8> = value
-            .into_iter()
-            .map(|b| {
-                if b == b'\t' || !(b < 0x20 || b == 0x7F) {
-                    b
-                } else {
-                    b' '
-                }
-            })
-            .collect();
-        let name: Vec<u8> = name
-            .into_iter()
-            .filter(|b| !matches!(*b, 0..=0x20 | b':' | 0x7F))
-            .collect();
+        for byte in &mut value {
+            if *byte != b'\t' && (*byte < 0x20 || *byte == 0x7F) {
+                *byte = b' ';
+            }
+        }
+        name.retain(|byte| !matches!(*byte, 0..=0x20 | b':' | 0x7F));
         if name.is_empty() {
             return;
         }
         let len = name.len().saturating_add(value.len()).saturating_add(4);
-        if self.would_exceed(len, config) {
+        if self.would_exceed(len, max_message_size) {
             self.over_limit = true;
             return;
         }
@@ -120,8 +112,8 @@ impl MessageState {
         self.headers.push((name, value));
     }
 
-    fn add_body(&mut self, data: &[u8], config: &CleanerConfig) {
-        if self.would_exceed(data.len(), config) {
+    fn add_body(&mut self, data: &[u8], max_message_size: usize) {
+        if self.would_exceed(data.len(), max_message_size) {
             self.over_limit = true;
             return;
         }
@@ -129,13 +121,60 @@ impl MessageState {
         self.body.extend_from_slice(data);
     }
 
-    fn would_exceed(&self, additional: usize, config: &CleanerConfig) -> bool {
+    fn would_exceed(&self, additional: usize, max_message_size: usize) -> bool {
         self.over_limit
             || self
                 .bytes_seen
                 .saturating_add(additional)
                 .saturating_add(2) // final header/body separator added by reconstruct()
-                > config.max_message_size
+                > max_message_size
+    }
+}
+
+enum PreparedConfigState {
+    Loading,
+    Ready(Arc<CleanerConfig>),
+    Failed,
+}
+
+struct PreparedConfig {
+    state: Mutex<PreparedConfigState>,
+    ready: Condvar,
+}
+
+impl PreparedConfig {
+    fn loading() -> Self {
+        Self {
+            state: Mutex::new(PreparedConfigState::Loading),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, config: Option<CleanerConfig>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state = match config {
+            Some(config) => PreparedConfigState::Ready(Arc::new(config)),
+            None => PreparedConfigState::Failed,
+        };
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> io::Result<Arc<CleanerConfig>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            match &*state {
+                PreparedConfigState::Loading => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                PreparedConfigState::Ready(config) => return Ok(Arc::clone(config)),
+                PreparedConfigState::Failed => {
+                    return Err(io::Error::other("rule preparation failed"));
+                }
+            }
+        }
     }
 }
 
@@ -149,26 +188,34 @@ struct Caps {
 /// Bind and serve the milter protocol on `config.listen`, one thread per
 /// connection. Blocks forever.
 pub fn run(config: CleanerConfig) -> crate::error::Result<()> {
-    let mut cfg = config;
-    cfg.finalize();
-    let listen = cfg.listen.clone();
-    let cfg = Arc::new(cfg);
-
-    let listener = TcpListener::bind(&listen)?;
+    let listen = config.listen.clone();
+    let max_message_size = config.max_message_size;
+    let (listener, activated) = acquire_listener(&listen)?;
+    let prepared = Arc::new(PreparedConfig::loading());
     eprintln!(
-        "email-privacy-milter {} listening on {} (mode={}, fail_open={})",
+        "email-privacy-milter {} listening on {} (socket={}, rules=loading)",
         crate::VERSION,
         listen,
-        cfg.mode.as_str(),
-        cfg.fail_open
+        if activated { "systemd" } else { "bound" },
     );
+    let preparation = Arc::clone(&prepared);
+    std::thread::spawn(move || {
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut config = config;
+            config.finalize();
+            config
+        }))
+        .ok();
+        preparation.publish(prepared);
+    });
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let cfg = Arc::clone(&cfg);
+                let prepared = Arc::clone(&prepared);
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &cfg) {
+                    if let Err(e) = handle_connection_preparing(stream, max_message_size, &prepared)
+                    {
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("milter connection error: {e}");
                         }
@@ -181,8 +228,82 @@ pub fn run(config: CleanerConfig) -> crate::error::Result<()> {
     Ok(())
 }
 
+fn acquire_listener(listen: &str) -> crate::error::Result<(TcpListener, bool)> {
+    #[cfg(unix)]
+    if let Some(listener) = systemd_listener()? {
+        return Ok((listener, true));
+    }
+    Ok((TcpListener::bind(listen)?, false))
+}
+
+#[cfg(unix)]
+fn systemd_listener() -> crate::error::Result<Option<TcpListener>> {
+    use std::os::fd::FromRawFd;
+
+    let listen_fds = std::env::var("LISTEN_FDS").ok();
+    let listen_pid = std::env::var("LISTEN_PID").ok();
+    let Some(fd) = systemd_activation_fd(
+        listen_fds.as_deref(),
+        listen_pid.as_deref(),
+        std::process::id(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    std::env::remove_var("LISTEN_PID");
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_FDNAMES");
+
+    // SAFETY: systemd's socket activation contract places the first inherited
+    // descriptor at fd 3. The matching LISTEN_PID check above ensures these
+    // variables describe this process rather than stale parent state.
+    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    listener.local_addr()?;
+    Ok(Some(listener))
+}
+
+#[cfg(unix)]
+fn systemd_activation_fd(
+    listen_fds: Option<&str>,
+    listen_pid: Option<&str>,
+    process_id: u32,
+) -> crate::error::Result<Option<i32>> {
+    let Some(fds) = listen_fds else {
+        return Ok(None);
+    };
+    let fds = fds.parse::<u32>().map_err(|_| {
+        crate::error::CleanerError::Config("invalid systemd LISTEN_FDS value".into())
+    })?;
+    if fds == 0 {
+        return Ok(None);
+    }
+    let listen_pid = listen_pid.and_then(|value| value.parse::<u32>().ok());
+    if listen_pid != Some(process_id) {
+        return Ok(None);
+    }
+    if fds != 1 {
+        return Err(crate::error::CleanerError::Config(format!(
+            "systemd passed {fds} sockets; exactly one is required"
+        )));
+    }
+    Ok(Some(3))
+}
+
 /// Handle a single milter connection.
-pub fn handle_connection(mut stream: TcpStream, config: &CleanerConfig) -> io::Result<()> {
+pub fn handle_connection(stream: TcpStream, config: &CleanerConfig) -> io::Result<()> {
+    let prepared = PreparedConfig {
+        state: Mutex::new(PreparedConfigState::Ready(Arc::new(config.clone()))),
+        ready: Condvar::new(),
+    };
+    handle_connection_preparing(stream, config.max_message_size, &prepared)
+}
+
+fn handle_connection_preparing(
+    mut stream: TcpStream,
+    max_message_size: usize,
+    prepared: &PreparedConfig,
+) -> io::Result<()> {
     stream.set_nodelay(true).ok();
     let mut state = MessageState::default();
     let mut caps = Caps {
@@ -211,16 +332,17 @@ pub fn handle_connection(mut stream: TcpStream, config: &CleanerConfig) -> io::R
             }
             SMFIC_HEADER => {
                 if let Some((name, value)) = parse_two_strings(&data) {
-                    state.add_header(name, value, config);
+                    state.add_header(name, value, max_message_size);
                 }
                 write_packet(&mut stream, SMFIR_CONTINUE, &[])?;
             }
             SMFIC_BODY => {
-                state.add_body(&data, config);
+                state.add_body(&data, max_message_size);
                 write_packet(&mut stream, SMFIR_CONTINUE, &[])?;
             }
             SMFIC_BODYEOB => {
-                handle_eom(&mut stream, &state, config, caps)?;
+                let config = prepared.wait()?;
+                handle_eom(&mut stream, &state, &config, caps)?;
                 state.reset();
             }
             SMFIC_ABORT => {
@@ -377,6 +499,10 @@ fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<bool>
 
 fn write_packet(stream: &mut TcpStream, cmd: u8, data: &[u8]) -> io::Result<()> {
     let len = (data.len() + 1) as u32;
+    if data.is_empty() {
+        let length = len.to_be_bytes();
+        return stream.write_all(&[length[0], length[1], length[2], length[3], cmd]);
+    }
     let mut out = Vec::with_capacity(5 + data.len());
     out.extend_from_slice(&len.to_be_bytes());
     out.push(cmd);
@@ -398,14 +524,184 @@ fn parse_two_strings(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RulePackFormat, RulePackSource};
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_activation_contract_requires_one_socket_for_this_process() {
+        assert_eq!(systemd_activation_fd(None, None, 42).unwrap(), None);
+        assert_eq!(
+            systemd_activation_fd(Some("0"), Some("42"), 42).unwrap(),
+            None
+        );
+        assert_eq!(
+            systemd_activation_fd(Some("1"), Some("41"), 42).unwrap(),
+            None
+        );
+        assert_eq!(
+            systemd_activation_fd(Some("1"), Some("42"), 42).unwrap(),
+            Some(3)
+        );
+
+        let multiple = systemd_activation_fd(Some("2"), Some("42"), 42).unwrap_err();
+        assert!(multiple.to_string().contains("exactly one"));
+        let invalid = systemd_activation_fd(Some("invalid"), Some("42"), 42).unwrap_err();
+        assert!(invalid.to_string().contains("invalid systemd LISTEN_FDS"));
+    }
+
+    #[test]
+    fn negotiation_runs_while_rules_are_preparing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let prepared = Arc::new(PreparedConfig::loading());
+        let server_prepared = Arc::clone(&prepared);
+        let max_message_size = CleanerConfig::default().max_message_size;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection_preparing(stream, max_message_size, &server_prepared)
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut negotiation = Vec::new();
+        negotiation.extend_from_slice(&6u32.to_be_bytes());
+        negotiation.extend_from_slice(&u32::MAX.to_be_bytes());
+        negotiation.extend_from_slice(&0u32.to_be_bytes());
+        write_packet(&mut client, SMFIC_OPTNEG, &negotiation).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap().0, SMFIR_OPTNEG);
+
+        prepared.publish(Some(CleanerConfig::default()));
+        write_packet(&mut client, SMFIC_QUIT, &[]).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn eom_waits_for_and_uses_the_finalized_rules() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let prepared = Arc::new(PreparedConfig::loading());
+        let server_prepared = Arc::clone(&prepared);
+        let max_message_size = CleanerConfig::default().max_message_size;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection_preparing(stream, max_message_size, &server_prepared)
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let mut negotiation = Vec::new();
+        negotiation.extend_from_slice(&6u32.to_be_bytes());
+        negotiation.extend_from_slice(&u32::MAX.to_be_bytes());
+        negotiation.extend_from_slice(&0u32.to_be_bytes());
+        write_packet(&mut client, SMFIC_OPTNEG, &negotiation).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap().0, SMFIR_OPTNEG);
+
+        write_packet(&mut client, SMFIC_MAIL, b"<sender@example.com>\0").unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap().0, SMFIR_CONTINUE);
+        for (name, value) in [
+            (b"From".as_slice(), b"sender@example.com".as_slice()),
+            (b"MIME-Version".as_slice(), b"1.0".as_slice()),
+            (
+                b"Content-Type".as_slice(),
+                b"text/html; charset=utf-8".as_slice(),
+            ),
+        ] {
+            let mut header = Vec::new();
+            header.extend_from_slice(name);
+            header.push(0);
+            header.extend_from_slice(value);
+            header.push(0);
+            write_packet(&mut client, SMFIC_HEADER, &header).unwrap();
+            assert_eq!(read_packet(&mut client).unwrap().unwrap().0, SMFIR_CONTINUE);
+        }
+        write_packet(
+            &mut client,
+            SMFIC_BODY,
+            br#"<a href="https://example.test/?worker_token=secret&id=1">x</a>"#,
+        )
+        .unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap().0, SMFIR_CONTINUE);
+        write_packet(&mut client, SMFIC_BODYEOB, &[]).unwrap();
+
+        let error = read_packet(&mut client).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "EOM unexpectedly completed before rules were ready: {error}"
+        );
+
+        let mut config = CleanerConfig::default();
+        config.rule_pack_sources.push(RulePackSource {
+            source: "in-memory".into(),
+            format: Some(RulePackFormat::ClearUrls),
+            usage: None,
+        });
+        config
+            .finalize_with_loader(&mut |_| {
+                Ok(br#"{"providers":{"test":{"urlPattern":"^https?://","rules":["worker_token"]}}}"#.to_vec())
+            })
+            .unwrap();
+        prepared.publish(Some(config));
+
+        let mut replacement = Vec::new();
+        loop {
+            let (command, data) = read_packet(&mut client).unwrap().unwrap();
+            match command {
+                SMFIR_REPLBODY => replacement.extend_from_slice(&data),
+                SMFIR_ADDHEADER => {}
+                SMFIR_CONTINUE => break,
+                other => panic!("unexpected EOM response: {}", other as char),
+            }
+        }
+        let replacement = String::from_utf8(replacement).unwrap();
+        assert!(!replacement.contains("worker_token"), "{replacement}");
+        assert!(replacement.contains("id=1"), "{replacement}");
+
+        write_packet(&mut client, SMFIC_QUIT, &[]).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn rule_preparation_failure_wakes_waiters() {
+        let prepared = Arc::new(PreparedConfig::loading());
+        let waiter_prepared = Arc::clone(&prepared);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(waiter_prepared.wait()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        prepared.publish(None);
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rule preparation waiter remained blocked")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("rule preparation failed"));
+        waiter.join().unwrap();
+    }
 
     #[test]
     fn reconstruct_builds_valid_message() {
         let mut s = MessageState::default();
         let cfg = CleanerConfig::default();
-        s.add_header(b"Subject".to_vec(), b"Hi".to_vec(), &cfg);
-        s.add_header(b"Content-Type".to_vec(), b"text/plain".to_vec(), &cfg);
-        s.add_body(b"hello world\r\n", &cfg);
+        s.add_header(b"Subject".to_vec(), b"Hi".to_vec(), cfg.max_message_size);
+        s.add_header(
+            b"Content-Type".to_vec(),
+            b"text/plain".to_vec(),
+            cfg.max_message_size,
+        );
+        s.add_body(b"hello world\r\n", cfg.max_message_size);
         let raw = s.reconstruct();
         let text = String::from_utf8(raw).unwrap();
         assert!(text.starts_with("Subject: Hi\r\nContent-Type: text/plain\r\n\r\nhello"));
@@ -416,7 +712,11 @@ mod tests {
         let mut cfg = CleanerConfig::default();
         cfg.max_message_size = 20;
         let mut s = MessageState::default();
-        s.add_header(b"Very-Long-Header".to_vec(), b"value".to_vec(), &cfg);
+        s.add_header(
+            b"Very-Long-Header".to_vec(),
+            b"value".to_vec(),
+            cfg.max_message_size,
+        );
         assert!(s.over_limit);
         assert!(s.headers.is_empty());
     }
@@ -426,7 +726,7 @@ mod tests {
         let mut cfg = CleanerConfig::default();
         cfg.max_message_size = 10;
         let mut s = MessageState::default();
-        s.add_body(b"123456789", &cfg);
+        s.add_body(b"123456789", cfg.max_message_size);
         assert!(s.over_limit);
         assert!(s.body.is_empty());
     }
@@ -450,15 +750,19 @@ mod tests {
             cfg.finalize();
 
             let mut state = MessageState::default();
-            state.add_header(b"From".to_vec(), b"sender@example.com".to_vec(), &cfg);
+            state.add_header(
+                b"From".to_vec(),
+                b"sender@example.com".to_vec(),
+                cfg.max_message_size,
+            );
             state.add_header(
                 b"Content-Type".to_vec(),
                 b"text/html; charset=utf-8".to_vec(),
-                &cfg,
+                cfg.max_message_size,
             );
             state.add_body(
                 br#"<a href="https://e.example/?utm_source=x&id=1">x</a>"#,
-                &cfg,
+                cfg.max_message_size,
             );
 
             handle_eom(
@@ -490,7 +794,7 @@ mod tests {
             cfg.max_message_size = 10;
             cfg.finalize();
             let mut state = MessageState::default();
-            state.add_body(b"123456789", &cfg);
+            state.add_body(b"123456789", cfg.max_message_size);
             assert!(state.over_limit);
             handle_eom(
                 &mut stream,

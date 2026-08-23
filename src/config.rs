@@ -7,11 +7,17 @@
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use crate::error::{CleanerError, Result};
-use crate::ruleset::Ruleset;
+use crate::ruleset::{RuleLoadLimits, RuleLoadReport, Ruleset, SkipReason};
+
+/// Resource limits used while loading external rule packs.
+pub type RuleResourceLimits = RuleLoadLimits;
+
+pub use crate::ruleset::{RulePackFormat, RulePackSource, RulePackUsage};
 
 /// Operating mode of the cleaner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -255,6 +261,11 @@ pub struct CleanerConfig {
     /// URLs and bare local paths are read offline in any build; `http(s)://`
     /// URLs are fetched at startup and require the `network` feature.
     pub rule_pack_urls: Vec<String>,
+    /// Structured rule-pack sources with optional format and usage hints.
+    pub rule_pack_sources: Vec<RulePackSource>,
+    /// Resource bounds applied independently of source transport.
+    #[serde(default)]
+    pub rule_limits: RuleResourceLimits,
 
     /// Listen address for the milter daemon.
     pub listen: String,
@@ -270,6 +281,8 @@ pub struct CleanerConfig {
     keep_param_prefixes: Option<Vec<String>>,
     #[serde(skip)]
     ruleset: Option<Arc<Ruleset>>,
+    #[serde(skip)]
+    finalization_key: Option<FinalizationKey>,
 }
 
 impl Default for CleanerConfig {
@@ -304,12 +317,15 @@ impl Default for CleanerConfig {
             disabled_providers: Vec::new(),
             rule_packs: Vec::new(),
             rule_pack_urls: Vec::new(),
+            rule_pack_sources: Vec::new(),
+            rule_limits: RuleResourceLimits::default(),
             listen: "127.0.0.1:11333".to_string(),
             tracking_params: None,
             tracking_prefixes: None,
             keep_param_set: None,
             keep_param_prefixes: None,
             ruleset: None,
+            finalization_key: None,
         }
     }
 }
@@ -338,6 +354,22 @@ fn split_param_patterns(list: &[String]) -> (HashSet<String>, Vec<String>) {
     (set, prefixes)
 }
 
+/// The public configuration exposes its source lists so callers can mutate
+/// them after finalization. Keep a compact description of
+/// the inputs that affect the derived lookup tables and compiled ruleset. This
+/// lets repeated finalization be idempotent without making those public fields
+/// private or requiring callers to manually invalidate a cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalizationKey {
+    extra_tracking_params: Vec<String>,
+    keep_params: Vec<String>,
+    disabled_providers: Vec<String>,
+    rule_packs: Vec<String>,
+    rule_pack_urls: Vec<String>,
+    rule_pack_sources: Vec<RulePackSource>,
+    rule_limits: RuleResourceLimits,
+}
+
 impl CleanerConfig {
     /// Load configuration from a TOML file.
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -346,18 +378,54 @@ impl CleanerConfig {
         Self::from_toml_str(&data)
     }
 
+    /// Parse a configuration file without reading or compiling rule packs.
+    pub fn parse_toml_file(path: impl AsRef<Path>) -> Result<Self> {
+        let data = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| CleanerError::Config(format!("reading {:?}: {e}", path.as_ref())))?;
+        Self::parse_toml_str(&data)
+    }
+
     /// Parse configuration from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        let mut cfg: CleanerConfig =
-            toml::from_str(s).map_err(|e| CleanerError::Config(e.to_string()))?;
+        let mut cfg = Self::parse_toml_str(s)?;
         cfg.finalize();
         Ok(cfg)
+    }
+
+    /// Parse TOML without reading or compiling configured rule packs.
+    pub fn parse_toml_str(s: &str) -> Result<Self> {
+        let mut cfg: CleanerConfig =
+            toml::from_str(s).map_err(|e| CleanerError::Config(e.to_string()))?;
+        cfg.ruleset = None;
+        Ok(cfg)
+    }
+
+    /// Compatibility alias for the unfinalized parse path.
+    pub fn from_toml_str_unfinalized(s: &str) -> Result<Self> {
+        Self::parse_toml_str(s)
+    }
+
+    fn finalization_key(&self) -> FinalizationKey {
+        FinalizationKey {
+            extra_tracking_params: self.extra_tracking_params.clone(),
+            keep_params: self.keep_params.clone(),
+            disabled_providers: self.disabled_providers.clone(),
+            rule_packs: self.rule_packs.clone(),
+            rule_pack_urls: self.rule_pack_urls.clone(),
+            rule_pack_sources: self.rule_pack_sources.clone(),
+            rule_limits: self.rule_limits,
+        }
     }
 
     /// Build the cached lookup tables. Call after mutating the param/domain
     /// lists; [`from_toml_*`](Self::from_toml_str) and the milter/CLI entry
     /// points do this automatically.
     pub fn finalize(&mut self) {
+        let key = self.finalization_key();
+        if self.ruleset.is_some() && self.finalization_key.as_ref() == Some(&key) {
+            return;
+        }
+
         let (set, prefixes) = split_param_patterns(&self.extra_tracking_params);
         self.tracking_params = Some(set);
         self.tracking_prefixes = Some(prefixes);
@@ -366,71 +434,162 @@ impl CleanerConfig {
         self.keep_param_set = Some(keep_set);
         self.keep_param_prefixes = Some(keep_prefixes);
 
-        self.ruleset = Some(Arc::new(self.build_ruleset()));
+        let ruleset = self.build_ruleset_with_loader(&mut |source| self.read_source(source));
+        log_rule_load_report(ruleset.load_report());
+        self.ruleset = Some(Arc::new(ruleset));
+        self.finalization_key = Some(key);
     }
 
-    /// Build the combined rule pack: the built-in pack plus any external packs,
-    /// then drop any `disabled_providers`. Packs that fail to load are skipped
-    /// with a warning so a bad pack can't take the cleaner down.
-    fn build_ruleset(&self) -> Ruleset {
-        let mut rs = Ruleset::builtin();
-        for path in &self.rule_packs {
-            self.merge_pack_file(&mut rs, path);
+    /// Finalize using an injected source loader. Each configured source is
+    /// passed to the loader at most once and is added to one builder before it
+    /// is frozen.
+    pub fn finalize_with_loader<F>(
+        &mut self,
+        loader: &mut F,
+    ) -> Result<crate::ruleset::RuleLoadReport>
+    where
+        F: FnMut(&str) -> Result<Vec<u8>>,
+    {
+        let key = self.finalization_key();
+        if let Some(ruleset) = &self.ruleset {
+            if self.finalization_key.as_ref() == Some(&key) {
+                return Ok(ruleset.load_report().clone());
+            }
         }
-        for entry in &self.rule_pack_urls {
-            self.merge_pack_url(&mut rs, entry);
-        }
-        if !self.disabled_providers.is_empty() {
-            rs.disable(&self.disabled_providers);
-        }
-        rs
+
+        let (set, prefixes) = split_param_patterns(&self.extra_tracking_params);
+        self.tracking_params = Some(set);
+        self.tracking_prefixes = Some(prefixes);
+        let (keep_set, keep_prefixes) = split_param_patterns(&self.keep_params);
+        self.keep_param_set = Some(keep_set);
+        self.keep_param_prefixes = Some(keep_prefixes);
+
+        let ruleset = self.build_ruleset_with_loader(loader);
+        let report = ruleset.load_report().clone();
+        log_rule_load_report(&report);
+        self.ruleset = Some(Arc::new(ruleset));
+        self.finalization_key = Some(key);
+        Ok(report)
     }
 
-    fn merge_pack_file(&self, rs: &mut Ruleset, path: &str) {
-        match std::fs::read_to_string(path) {
-            Ok(s) => match Ruleset::from_clearurls_str(&s) {
-                Ok(pack) => rs.merge(pack),
-                Err(e) => eprintln!("warning: rule pack {path:?} failed to parse: {e}"),
-            },
-            Err(e) => eprintln!("warning: rule pack {path:?} could not be read: {e}"),
+    fn build_ruleset_with_loader<F>(&self, loader: &mut F) -> Ruleset
+    where
+        F: FnMut(&str) -> Result<Vec<u8>>,
+    {
+        use crate::ruleset::RulesetBuilder;
+        // The built-in pack occupies one builder source and its bytes. Keep
+        // the public limits scoped to external sources by reserving those
+        // bookkeeping slots for the built-in source.
+        let mut limits = self.rule_limits;
+        limits.max_rule_pack_sources = limits.max_rule_pack_sources.saturating_add(1);
+        limits.max_total_rule_pack_bytes = limits
+            .max_total_rule_pack_bytes
+            .saturating_add(include_str!("../rules/builtin.json").len());
+        let mut builder = RulesetBuilder::new(limits);
+        builder
+            .add_source_str(
+                "builtin",
+                include_str!("../rules/builtin.json"),
+                Some(RulePackFormat::ClearUrls),
+                None,
+            )
+            .expect("built-in rules/builtin.json must be valid");
+        builder.disable_providers(&self.disabled_providers);
+
+        let mut sources = Vec::new();
+        sources.extend(self.rule_packs.iter().map(|source| RulePackSource {
+            source: source.clone(),
+            format: Some(RulePackFormat::ClearUrls),
+            usage: None,
+        }));
+        sources.extend(self.rule_pack_urls.iter().map(|source| RulePackSource {
+            source: source.clone(),
+            format: Some(RulePackFormat::ClearUrls),
+            usage: None,
+        }));
+        sources.extend(self.rule_pack_sources.iter().cloned());
+
+        let mut seen = HashSet::new();
+        let mut external_sources = 0usize;
+        let mut external_bytes = 0usize;
+        for source in sources {
+            if !seen.insert(source.source.clone()) {
+                continue;
+            }
+            if external_sources >= self.rule_limits.max_rule_pack_sources {
+                builder.record_skipped_source(
+                    source.source,
+                    0,
+                    SkipReason::SourceCountLimit,
+                    source.format,
+                );
+                continue;
+            }
+            external_sources += 1;
+            match loader(&source.source) {
+                Ok(bytes) => {
+                    if bytes.len() > self.rule_limits.max_rule_pack_bytes
+                        || external_bytes.saturating_add(bytes.len())
+                            > self.rule_limits.max_total_rule_pack_bytes
+                    {
+                        let reason = if bytes.len() > self.rule_limits.max_rule_pack_bytes {
+                            SkipReason::ByteLimit
+                        } else {
+                            SkipReason::TotalByteLimit
+                        };
+                        builder.record_skipped_source(
+                            source.source,
+                            bytes.len(),
+                            reason,
+                            source.format,
+                        );
+                    } else {
+                        external_bytes += bytes.len();
+                        let _ = builder.add_source_bytes(
+                            source.source,
+                            &bytes,
+                            source.format,
+                            source.usage,
+                        );
+                    }
+                }
+                Err(_) => {
+                    builder.record_skipped_source(source.source, 0, SkipReason::Io, source.format);
+                }
+            }
         }
+        builder.finish()
     }
 
-    /// Load a `rule_pack_urls` entry. `file://` URLs and bare local paths are
-    /// read from disk in any build (so Nix users can prefetch a remote pack into
-    /// the store and reference it offline); `http(s)://` URLs require the
-    /// `network` feature.
-    fn merge_pack_url(&self, rs: &mut Ruleset, entry: &str) {
-        let entry = entry.trim();
-        if let Some(path) = entry.strip_prefix("file://") {
-            self.merge_pack_file(rs, path);
-            return;
+    fn read_source(&self, source: &str) -> Result<Vec<u8>> {
+        let source = source.trim();
+        if source.starts_with("https://") {
+            #[cfg(feature = "network")]
+            {
+                return crate::network::fetch_rule_pack_with_limit(
+                    source,
+                    self.timeout_ms,
+                    self.rule_limits.max_rule_pack_bytes,
+                );
+            }
+            #[cfg(not(feature = "network"))]
+            {
+                return Err(CleanerError::Network(
+                    "HTTPS rule packs require the network feature".into(),
+                ));
+            }
         }
-        if entry.starts_with("http://") {
-            eprintln!(
-                "warning: rule pack {entry:?} uses insecure HTTP; use HTTPS, file://, or a local path. Ignoring."
-            );
-            return;
+        if source.starts_with("http://") {
+            return Err(CleanerError::Config(
+                "insecure HTTP rule-pack source rejected".into(),
+            ));
         }
-        let is_https = entry.starts_with("https://");
-        if !is_https {
-            // Treat anything else as a local path.
-            self.merge_pack_file(rs, entry);
-            return;
-        }
-        #[cfg(feature = "network")]
-        match crate::network::fetch_rule_pack(entry, self.timeout_ms) {
-            Ok(s) => match Ruleset::from_clearurls_str(&s) {
-                Ok(pack) => rs.merge(pack),
-                Err(e) => eprintln!("warning: rule pack {entry:?} failed to parse: {e}"),
-            },
-            Err(e) => eprintln!("warning: rule pack {entry:?} could not be fetched: {e}"),
-        }
-        #[cfg(not(feature = "network"))]
-        eprintln!(
-            "warning: rule pack {entry:?} needs the `network` feature to fetch over HTTP; \
-             prefetch it and use a file path or file:// URL instead. Ignoring."
-        );
+        let path = source.strip_prefix("file://").unwrap_or(source);
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        let mut reader = file.take(self.rule_limits.max_rule_pack_bytes as u64 + 1);
+        reader.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     /// The active rule pack (built-in + merged external packs). Falls back to the
@@ -594,6 +753,28 @@ impl CleanerConfig {
             .map(|d| d.to_ascii_lowercase())
             .any(|d| host == d || host.ends_with(&format!(".{d}")))
     }
+}
+
+fn log_rule_load_report(report: &RuleLoadReport) {
+    for source in &report.sources {
+        eprintln!(
+            "rule-pack source={} format={:?} bytes={} parsed={} accepted={} unsupported={} duplicates={} failed_regexes={} skipped={:?}",
+            source.source,
+            source.format,
+            source.bytes_read,
+            source.parsed_rules,
+            source.accepted_rules,
+            source.unsupported_rules,
+            source.duplicates,
+            source.failed_regexes,
+            source.skipped_reason,
+        );
+    }
+    eprintln!(
+        "rule-pack totals: sources={} accepted_bytes={}",
+        report.sources.len(),
+        report.total_bytes
+    );
 }
 
 /// Returns `true` if `sender_domain` matches a built-in sensitive-sender

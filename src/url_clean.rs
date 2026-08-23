@@ -1,11 +1,29 @@
-//! Tracking query-parameter removal.
+//! Tracking query-parameter removal with source-specific matching semantics.
+//!
+//! The compiled rule store keeps the input format's query model intact:
+//!
+//! * ClearURLs rules match form/percent-decoded parameter names
+//!   case-insensitively, including query segments without `=`.
+//! * Brave Clean URLs rules compare the raw query key case-sensitively and
+//!   remove it only when the segment contains `=`.
+//! * AdGuard named `$removeparam=name` rules match a decoded name (with
+//!   `$match-case` controlling the name comparison) and also apply to
+//!   no-value segments; regex `$removeparam=/name=value/` rules match the
+//!   decoded `name=value` pair and require `=`.
+//!
+//! These format-specific rules are evaluated alongside the user's global
+//! tracking-parameter list. A source's exception only affects the compatible
+//! action and scope; it does not suppress unrelated rules from another format.
+//! The compatibility [`Ruleset::param_is_tracking`](crate::ruleset::Ruleset::param_is_tracking)
+//! helper accepts a bare name, but this cleaner always
+//! passes the original query segment so a Brave no-value segment is preserved.
 
 use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::config::CleanerConfig;
 
-/// Outcome of [`clean_url`](crate::clean_url).
+/// Outcome of [`clean_url`].
 #[derive(Debug, Clone)]
 pub struct UrlCleanResult {
     /// The cleaned URL (equal to the input when nothing changed).
@@ -18,13 +36,14 @@ pub struct UrlCleanResult {
 
 /// Remove known tracking query parameters from `url`.
 ///
-/// Parameter *names* are matched case-insensitively. Removal combines the
-/// user-supplied global params (`extra_tracking_params`) with the rule pack:
-/// global rules always apply, host-specific (vendor) rules apply when
-/// `apply_vendor_rules` is set, and referral-marketing rules apply when
-/// `strip_referral_marketing` is set. The raw encoding of the surviving
-/// parameters is preserved byte-for-byte so we don't accidentally re-encode
-/// values (which could break signed/magic links).
+/// Removal combines the user-supplied global params (`extra_tracking_params`)
+/// with the rule pack: global rules always apply, host-specific (vendor) rules
+/// apply when `apply_vendor_rules` is set, and referral-marketing rules apply
+/// when `strip_referral_marketing` is set. Rule-pack matching follows the
+/// source-specific semantics documented at the top of this module; the
+/// user-supplied global list uses the decoded parameter name. The raw encoding
+/// of surviving parameters is preserved byte-for-byte so we don't accidentally
+/// re-encode values (which could break signed/magic links).
 pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
     let query = match url.query() {
         Some(q) if !q.is_empty() => q,
@@ -40,18 +59,25 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
     let ruleset = config.ruleset();
     let url_str = url.as_str();
 
-    // An excluded host, or a provider exception, means "leave this URL as-is".
+    // An excluded host means "leave this URL as-is". Provider exceptions are
+    // evaluated per action below; they must not suppress unrelated global,
+    // Brave, or user-defined rules.
     let excluded = url
         .host_str()
         .map(|h| config.is_excluded_domain(h))
         .unwrap_or(false);
-    if excluded || ruleset.is_exception(url_str) {
+    if excluded {
         return UrlCleanResult {
             url: url.clone(),
             changed: false,
             removed_params: Vec::new(),
         };
     }
+
+    // Scope matching is URL-level work. Keep one immutable context for every
+    // query segment so source-specific raw/decoded semantics and exceptions
+    // are applied consistently without rescanning provider scopes.
+    let context = ruleset.context_for(url_str, url);
 
     let mut kept: Vec<&str> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
@@ -68,9 +94,8 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
         // The keep-list always wins, even over a matching rule.
         let is_tracker = !config.is_kept_param(&key)
             && (config.is_tracking_param(&key)
-                || ruleset.param_is_tracking(
-                    url_str,
-                    &key,
+                || context.should_remove_parameter(
+                    segment,
                     config.apply_vendor_rules,
                     config.strip_referral_marketing,
                 ));
@@ -107,6 +132,7 @@ pub fn clean_url(url: &Url, config: &CleanerConfig) -> UrlCleanResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RulePackFormat, RulePackSource};
 
     fn cfg() -> CleanerConfig {
         let mut c = CleanerConfig::default();
@@ -192,5 +218,72 @@ mod tests {
         let u = Url::parse("https://www.amazon.com/dp/B000?pf_rd_r=foo&id=1").unwrap();
         let r = clean_url(&u, &c);
         assert!(!r.changed);
+    }
+
+    #[test]
+    fn clearurls_matches_decoded_case_insensitive_names_with_or_without_values() {
+        let mut c = CleanerConfig::default();
+        c.rule_packs = vec![write_pack(
+            r#"{"providers":{"clear":{"urlPattern":"^https?://example\\.test","rules":["trk"]}}}"#,
+        )];
+        c.finalize();
+        let _ = std::fs::remove_file(&c.rule_packs[0]);
+
+        let u = Url::parse("https://example.test/p?TRK&tr%6b=value&keep=1").unwrap();
+        let r = clean_url(&u, &c);
+        assert_eq!(r.url.as_str(), "https://example.test/p?keep=1");
+    }
+
+    #[test]
+    fn clearurls_provider_exception_preserves_legacy_clearurls_carveout() {
+        let mut c = CleanerConfig::default();
+        c.rule_packs = vec![write_pack(
+            r#"{"providers":{"clear":{"urlPattern":"^https?://example\\.test","rules":["provider_id"],"exceptions":["keep"]}}}"#,
+        )];
+        c.finalize();
+        let _ = std::fs::remove_file(&c.rule_packs[0]);
+
+        let u = Url::parse("https://example.test/p?provider_id=1&keep=1&utm_source=x").unwrap();
+        let r = clean_url(&u, &c);
+        assert_eq!(
+            r.url.as_str(),
+            "https://example.test/p?provider_id=1&keep=1&utm_source=x"
+        );
+    }
+
+    #[test]
+    fn brave_configured_source_keeps_raw_case_and_requires_equals() {
+        let mut c = CleanerConfig::default();
+        c.disabled_providers = vec!["globalRules".into()];
+        c.rule_pack_sources = vec![RulePackSource {
+            source: write_pack(
+                r#"[{"include":["*://example.test/*"],"exclude":[],"params":["UTM_Source"]}]"#,
+            ),
+            format: Some(RulePackFormat::BraveCleanUrls),
+            usage: None,
+        }];
+        c.finalize();
+        let _ = std::fs::remove_file(&c.rule_pack_sources[0].source);
+
+        let u = Url::parse("https://example.test/p?UTM_Source=x&utm_source=x&UTM_Source&keep=1")
+            .unwrap();
+        let r = clean_url(&u, &c);
+        assert_eq!(
+            r.url.as_str(),
+            "https://example.test/p?utm_source=x&UTM_Source&keep=1"
+        );
+    }
+
+    fn write_pack(json: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "epc-url-clean-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, json).unwrap();
+        path.to_string_lossy().into_owned()
     }
 }

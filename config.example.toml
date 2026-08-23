@@ -147,15 +147,18 @@ disabled_providers = [
   # "amazon",
 ]
 
-# --- External rule packs (ClearURLs format) ---------------------------------
+# --- External rule packs and format contract --------------------------------
 #
-# The built-in rules ship as a ClearURLs-format JSON document compiled into the
-# binary (rules/builtin.json). You can layer additional ClearURLs-format packs
-# on top — including the upstream ClearURLs data.min.json — to extend coverage
-# without code changes. Loaded packs AUGMENT the built-ins (union of providers).
+# The binary includes only a small, manually maintained built-in list in
+# rules/builtin.json. You can layer optional external packs on top to extend
+# coverage without code changes. Loaded packs augment the built-ins.
 #
-# NOTE: the upstream ClearURLs rules are copyleft (LGPL); this crate ships only
-# the parser, not that data. Download and point at it yourself if you want it.
+# The string arrays below are supported and mean ClearURLs JSON.
+# Structured entries use `source`; `path` and `url` are accepted aliases.
+# `format` is optional and accepts `auto`, `clear-urls`, `brave-clean-urls`,
+# `brave-debounce`, or canonical `ad-guard` (`adguard` is also accepted for
+# compatibility). `usage` is optional and accepts
+# only `mail-beacon`.
 # Patterns using regex features unsupported by Rust's linear-time engine are
 # skipped individually; the rest of the pack still loads.
 rule_packs = [
@@ -164,13 +167,66 @@ rule_packs = [
 
 # Pack URLs. `file://` URLs and bare local paths are read offline in any build;
 # `http(s)://` URLs are fetched once at startup and require the `network`
-# feature. (Either way this is startup-only; the per-message path stays offline.)
+# feature. Rule-pack loading is startup-only: no pack URL is fetched during
+# per-message cleaning. (The separate network redirect resolver is still an
+# explicitly opt-in per-message feature.)
 # Nix users can prefetch a remote pack into the store and reference it as a
 # file:// path here — or, more idiomatically, via the module's `rulePacks`.
 rule_pack_urls = [
   # "https://rules2.clearurls.xyz/data.min.json",   # needs the `network` feature
   # "file:///var/lib/email-privacy-cleaner/clearurls.json",  # offline
 ]
+
+# Structured sources. Each distinct source is attempted once during startup;
+# duplicate source strings are collapsed. No source is loaded per message.
+# `source`, `path`, and `url` are equivalent field names.
+#[[rule_pack_sources]]
+#source = "/etc/email-privacy-cleaner/clearurls.json"
+#format = "clear-urls"
+
+#[[rule_pack_sources]]
+#url = "https://example.invalid/adguard.txt"
+#format = "ad-guard"
+#usage = "mail-beacon"  # permits modifierless AdGuard image rules
+
+# Recommended source order and purpose:
+# 1. Built-in rules are always loaded.
+# 2. ClearURLs (`clear-urls`) adds broad provider-specific URL cleaning.
+# 3. Brave Clean URLs (`brave-clean-urls`) adds raw, case-sensitive parameter rules.
+# 4. Brave Debounce (`brave-debounce`) adds supported offline redirect unwrapping.
+# 5. A reviewed AdGuard mail list uses `ad-guard` plus `usage = "mail-beacon"`
+#    for image/CSS beacon rules. Start in report-only mode and inspect the
+#    resulting rule-stats/audit output before enabling enforcement.
+#
+# For a complete online starter setup, uncomment one source at a time and
+# inspect its report before adding the next one:
+# [[rule_pack_sources]]
+# source = "https://rules2.clearurls.xyz/data.min.json"
+# format = "clear-urls"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/clean-urls.json"
+# format = "brave-clean-urls"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/brave/adblock-lists/master/brave-lists/debounce.json"
+# format = "brave-debounce"
+# [[rule_pack_sources]]
+# source = "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/TrackParamFilter/sections/general_url.txt"
+# format = "ad-guard"
+# [[rule_pack_sources]]
+# source = "https://filters.adtidy.org/extension/chromium/filters/25.txt"
+# format = "ad-guard"
+# usage = "mail-beacon"
+
+# Resource bounds for structured and string-array external sources. Defaults:
+# 5 MiB per source, 25 MiB total, 32 sources, 50,000 external rules,
+# 10,000 regex rules, and 16 retained diagnostic samples per source.
+#[rule_limits]
+#max_rule_pack_bytes = 5242880
+#max_total_rule_pack_bytes = 26214400
+#max_rule_pack_sources = 32
+#max_external_rules = 50000
+#max_regex_rules = 10000
+#max_diagnostic_samples = 16
 
 # Tip: the CLI and milter also accept `--rule-pack <PATH>` (repeatable), which
 # merges on top of these — handy with `--config` or a read-only config file.
