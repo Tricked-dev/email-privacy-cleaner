@@ -19,8 +19,8 @@ shell after:
 direnv allow
 ```
 
-Cargo metadata declares Rust 1.75 as the minimum supported Rust version. CI
-checks both 1.75 and stable on Linux. Contributors who do not use Nix must
+Cargo metadata declares Rust 1.85 as the minimum supported Rust version. CI
+checks both 1.85 and stable on Linux. Contributors who do not use Nix must
 install Rust, rustfmt, and Clippy themselves.
 
 ## Source map
@@ -167,7 +167,7 @@ When adding an option:
 The repository has two GitHub Actions workflows:
 
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the Rust matrix on
-  Rust 1.75 and stable, followed by `nix flake check`. Its branch filters target
+  Rust 1.85 and stable, followed by `nix flake check`. Its branch filters target
   `master`.
 - [`.github/workflows/docker.yml`](.github/workflows/docker.yml) builds release
   binaries on Linux, pushes a GHCR image, and uploads an

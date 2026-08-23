@@ -24,9 +24,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Cargo.toml declares rust-version = "1.75" (MSRV) — make sure that
+        # Cargo.toml declares rust-version = "1.85" (MSRV) — make sure that
         # contract holds, in addition to stable.
-        toolchain: ["1.75", "stable"]
+        toolchain: ["1.85", "stable"]
 
     steps:
       - uses: actions/checkout@v4

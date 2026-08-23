@@ -2,7 +2,7 @@
 name = "email_privacy_cleaner"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "Email privacy sanitizer library + milter daemon for Stalwart Mail Server. Strips tracking pixels, cleans tracking query params, and unwraps ESP redirect links offline."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tricked-dev/email-privacy-cleaner"

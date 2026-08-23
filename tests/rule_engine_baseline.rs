@@ -2,7 +2,7 @@
 //!
 //! This is intentionally an ignored integration test rather than a Criterion
 //! benchmark: it adds no dependency or Cargo target, and it keeps the numbers
-//! comparable across Rust 1.75 and stable. Run with `--nocapture` to see the
+//! comparable across Rust 1.85 and stable. Run with `--nocapture` to see the
 //! three timings. The timings are diagnostic only; correctness assertions make
 //! the corpus useful even when wall-clock noise is high.
 //!

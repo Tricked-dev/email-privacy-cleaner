@@ -77,7 +77,7 @@ removed pixels, and stripped link pings.
 ## Installation
 
 The repository provides Nix packages for 64-bit Intel and ARM Linux and macOS,
-a Cargo source build validated by Linux CI with Rust 1.75 and stable, and a
+a Cargo source build validated by Linux CI with Rust 1.85 and stable, and a
 Linux container build. It does not define Homebrew, apt/dnf, crates.io, Windows,
 or downloadable macOS binary installation paths.
 
@@ -104,7 +104,7 @@ ambiguity.
 
 ### Build from source with Cargo
 
-Install Rust 1.75 or newer, then build and install both binaries from a checkout:
+Install Rust 1.85 or newer, then build and install both binaries from a checkout:
 
 ```bash
 git clone https://github.com/Tricked-dev/email-privacy-cleaner.git

@@ -279,10 +279,10 @@ fn process_href(
 
     let url = match Url::parse(&parse_input) {
         Ok(u) => u,
-        Err(url::ParseError::RelativeUrlWithoutBase) => match base_url {
-            Some(base) => base.join(&parse_input).ok()?,
-            None => return None,
-        },
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            let base = base_url?;
+            base.join(&parse_input).ok()?
+        }
         Err(_) => return None,
     };
 

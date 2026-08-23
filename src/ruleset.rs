@@ -941,12 +941,11 @@ impl RulesetBuilder {
             report_index,
             &mut counters,
         )
-        .map_err(|e| {
+        .inspect_err(|_| {
             report.skipped_reason = Some(SkipReason::Parse);
             if retain_report {
                 self.report.sources.push(report.clone());
             }
-            e
         })?;
 
         report.parsed_rules = ir.parsed_rules;
